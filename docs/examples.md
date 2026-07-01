@@ -18,7 +18,7 @@ Shows `ctx.sleep()`, external `worker.sleep(jobId, durationMs)`, `waitFor()`, an
 
 ## Diagnostics
 
-Shows aggregate `getDiagnostics()` counters and `getJobDiagnostics()` for a job. Completed jobs remain available for diagnostics until `waitFor()` consumes them, `clearFinished()` is called, or Worker ends.
+Shows aggregate `getDiagnostics()` counters and `getJobDiagnostics()` for a job. Completed jobs remain available for diagnostics until `waitFor()` can consume them after task cleanup, `clearFinished()` is called, or Worker ends.
 
 ## BindableCallbacks
 

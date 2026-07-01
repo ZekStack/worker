@@ -91,7 +91,7 @@ void loop() {
 
 * A callback that blocks forever will prevent `stopAndWait()` and timed `end()` calls from completing before their timeout. The destructor waits without a timeout so tasks cannot outlive Worker internals.
 * `every(intervalMs, callback)` delays internally after each callback.
-* Completed jobs are retained until `waitFor()` consumes them, `clearFinished()` is called, or Worker ends.
+* Completed jobs are retained until `waitFor()` can consume them after task cleanup, `clearFinished()` is called, or Worker ends.
 * Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes.
 * Custom task names are copied into a fixed internal buffer and may be truncated.
 * `WorkerStackType::Auto` prefers PSRAM task stacks when supported and falls back to internal RAM.
@@ -160,7 +160,7 @@ For the full API, see [`docs/api.md`](docs/api.md).
 | PSRAM | Optional for task stacks when ESP-IDF support is available |
 | Dependencies | none |
 | Exceptions | Not used |
-| Status | Early-stage `0.0.1` |
+| Status | Early-stage `0.1.0` |
 
 ## Configuration
 

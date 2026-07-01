@@ -1,6 +1,6 @@
 {
   "name": "Worker",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "FreeRTOS task and cooperative job execution library for ESP32.",
   "keywords": [
     "esp32",

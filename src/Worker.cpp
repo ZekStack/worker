@@ -15,6 +15,27 @@ constexpr WorkerJobId kInvalidJobId = 0;
 constexpr uint32_t kWaitPollMs = 10;
 constexpr size_t kMaxTaskNameLength = 32;
 
+uint32_t nowMs() {
+	return static_cast<uint32_t>(millis());
+}
+
+bool elapsedSince(uint32_t startMs, uint32_t timeoutMs) {
+	return timeoutMs != UINT32_MAX &&
+	       static_cast<uint32_t>(nowMs() - startMs) >= timeoutMs;
+}
+
+uint32_t remainingSince(uint32_t startMs, uint32_t durationMs) {
+	if (durationMs == UINT32_MAX) {
+		return UINT32_MAX;
+	}
+	const uint32_t elapsedMs = static_cast<uint32_t>(nowMs() - startMs);
+	return elapsedMs >= durationMs ? 0 : durationMs - elapsedMs;
+}
+
+TickType_t waitTicks(uint32_t durationMs) {
+	return durationMs == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(durationMs);
+}
+
 bool isTerminalState(WorkerJobState state) {
 	return state == WorkerJobState::Stopped || state == WorkerJobState::Finished ||
 	       state == WorkerJobState::Failed;
@@ -47,11 +68,14 @@ struct WorkerJobRecord {
 	bool createdWithCaps = false;
 	std::atomic<bool> stopRequested{false};
 	WorkerJobState state = WorkerJobState::Created;
+	bool hasStarted = false;
 	uint32_t runCount = 0;
-	uint64_t startedAtMs = 0;
-	uint64_t lastRunAtMs = 0;
-	uint64_t finishedAtMs = 0;
-	uint64_t sleepUntilMs = 0;
+	uint32_t startedAtMs = 0;
+	uint32_t lastRunAtMs = 0;
+	uint32_t finishedAtMs = 0;
+	uint32_t sleepStartMs = 0;
+	uint32_t sleepDurationMs = 0;
+	bool hasSleepDeadline = false;
 	size_t stackHighWaterMarkBytes = 0;
 	bool terminalAccounted = false;
 	bool taskExited = false;
@@ -201,7 +225,7 @@ struct WorkerImpl {
 			return;
 		}
 		job->state = WorkerJobState::Failed;
-		job->finishedAtMs = millis();
+		job->finishedAtMs = nowMs();
 		job->taskHandle = nullptr;
 		job->taskExited = true;
 		accountTerminalJob(job);
@@ -218,7 +242,7 @@ struct WorkerImpl {
 			    jobId
 			);
 		}
-		const uint64_t startMs = millis();
+		const uint32_t startMs = nowMs();
 		while (true) {
 			{
 				WorkerLock lock(mutex);
@@ -228,13 +252,15 @@ struct WorkerImpl {
 					    jobId
 					);
 				}
-				if (isReapableJob(job)) {
-					reapJob(job);
+				if (isTerminalState(job->state)) {
+					if (job->taskExited) {
+						reapJob(job);
+					}
 					return WorkerResult::success("job finished");
 				}
 			}
 
-			if (timeoutMs != UINT32_MAX && static_cast<uint64_t>(millis()) - startMs >= timeoutMs) {
+			if (elapsedSince(startMs, timeoutMs)) {
 				return emitResult(
 				    WorkerResult::failure(WorkerStatus::Timeout, "wait timed out"),
 				    jobId
@@ -275,7 +301,7 @@ struct WorkerImpl {
 		}
 		job->state = state;
 		if (updateFinishTime) {
-			job->finishedAtMs = millis();
+			job->finishedAtMs = nowMs();
 		}
 	}
 
@@ -284,11 +310,12 @@ struct WorkerImpl {
 		if (!lock || !job) {
 			return;
 		}
-		const uint64_t nowMs = millis();
-		if (job->startedAtMs == 0) {
-			job->startedAtMs = nowMs;
+		const uint32_t currentMs = nowMs();
+		if (!job->hasStarted) {
+			job->hasStarted = true;
+			job->startedAtMs = currentMs;
 		}
-		job->lastRunAtMs = nowMs;
+		job->lastRunAtMs = currentMs;
 		job->runCount++;
 		job->state = WorkerJobState::Running;
 	}
@@ -306,7 +333,7 @@ struct WorkerImpl {
 				job->stackHighWaterMarkBytes =
 				    worker_task_support::currentStackHighWaterMarkBytes();
 				job->state = finalState;
-				job->finishedAtMs = millis();
+				job->finishedAtMs = nowMs();
 				job->taskHandle = nullptr;
 				accountTerminalJob(job);
 			}
@@ -331,36 +358,39 @@ struct WorkerImpl {
 		if (!job || durationMs == 0) {
 			return true;
 		}
-		const uint64_t targetMs = static_cast<uint64_t>(millis()) + durationMs;
-		return waitUntil(job, targetMs);
+		return waitForDuration(job, durationMs);
 	}
 
-	bool waitUntil(const std::shared_ptr<WorkerJobRecord> &job, uint64_t targetMs) {
+	bool waitForDuration(const std::shared_ptr<WorkerJobRecord> &job, uint32_t durationMs) {
 		if (!job) {
 			return false;
 		}
+		const uint32_t startMs = nowMs();
 		while (!job->stopRequested.load()) {
-			uint64_t effectiveTarget = targetMs;
+			uint32_t remainingMs = remainingSince(startMs, durationMs);
 			{
 				WorkerLock lock(mutex);
 				if (lock) {
-					effectiveTarget = std::max(effectiveTarget, job->sleepUntilMs);
+					uint32_t externalRemainingMs = 0;
+					if (job->hasSleepDeadline) {
+						externalRemainingMs =
+						    remainingSince(job->sleepStartMs, job->sleepDurationMs);
+						if (externalRemainingMs == 0) {
+							job->hasSleepDeadline = false;
+						}
+					}
+					remainingMs = std::max(remainingMs, externalRemainingMs);
 					if (!isTerminalState(job->state)) {
 						job->state = WorkerJobState::Sleeping;
 					}
 				}
 			}
 
-			const uint64_t nowMs = millis();
-			if (nowMs >= effectiveTarget) {
+			if (remainingMs == 0) {
 				break;
 			}
 
-			uint64_t remainingMs = effectiveTarget - nowMs;
-			if (remainingMs > UINT32_MAX) {
-				remainingMs = UINT32_MAX;
-			}
-			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(static_cast<uint32_t>(remainingMs)));
+			ulTaskNotifyTake(pdTRUE, waitTicks(remainingMs));
 		}
 		return !job->stopRequested.load();
 	}
@@ -375,8 +405,12 @@ struct WorkerImpl {
 			if (!lock || isTerminalState(job->state)) {
 				return;
 			}
-			job->sleepUntilMs =
-			    std::max(job->sleepUntilMs, static_cast<uint64_t>(millis()) + durationMs);
+			const uint32_t existingRemainingMs = job->hasSleepDeadline
+			    ? remainingSince(job->sleepStartMs, job->sleepDurationMs)
+			    : 0;
+			job->sleepStartMs = nowMs();
+			job->sleepDurationMs = std::max(existingRemainingMs, durationMs);
+			job->hasSleepDeadline = true;
 			job->state = WorkerJobState::Sleeping;
 			handle = job->taskHandle;
 		}
@@ -542,8 +576,7 @@ struct WorkerImpl {
 				if (job->stopRequested.load()) {
 					break;
 				}
-				const uint64_t nextRunMs = static_cast<uint64_t>(millis()) + job->intervalMs;
-				owner->waitUntil(job, nextRunMs);
+				owner->waitForDuration(job, job->intervalMs);
 			}
 			finalState = WorkerJobState::Stopped;
 		} else {
@@ -988,7 +1021,7 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 		xTaskNotifyGive(handle);
 	}
 
-	const uint64_t startMs = millis();
+	const uint32_t startMs = nowMs();
 	while (true) {
 		bool allFinished = true;
 		{
@@ -1006,7 +1039,7 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 		if (allFinished) {
 			break;
 		}
-		if (timeoutMs != UINT32_MAX && static_cast<uint64_t>(millis()) - startMs >= timeoutMs) {
+		if (elapsedSince(startMs, timeoutMs)) {
 			return _impl->emitResult(
 			    WorkerResult::failure(WorkerStatus::Timeout, "worker end timed out")
 			);
