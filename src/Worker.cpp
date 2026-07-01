@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <vector>
@@ -12,17 +13,28 @@
 namespace {
 constexpr WorkerJobId kInvalidJobId = 0;
 constexpr uint32_t kWaitPollMs = 10;
+constexpr size_t kMaxTaskNameLength = 32;
 
 bool isTerminalState(WorkerJobState state) {
 	return state == WorkerJobState::Stopped || state == WorkerJobState::Finished ||
 	       state == WorkerJobState::Failed;
+}
+
+bool isReapableJob(const std::shared_ptr<WorkerJobRecord> &job);
+
+void copyTaskName(char *destination, size_t destinationSize, const char *source) {
+	if (destination == nullptr || destinationSize == 0 || source == nullptr || *source == '\0') {
+		return;
+	}
+	std::strncpy(destination, source, destinationSize - 1);
+	destination[destinationSize - 1] = '\0';
 }
 } // namespace
 
 struct WorkerJobRecord {
 	WorkerImpl *owner = nullptr;
 	WorkerJobId id = kInvalidJobId;
-	std::string name = "worker-job";
+	char name[kMaxTaskNameLength] = "worker-job";
 	WorkerCallback callback;
 	bool recurring = false;
 	uint32_t intervalMs = 0;
@@ -42,7 +54,14 @@ struct WorkerJobRecord {
 	uint64_t sleepUntilMs = 0;
 	size_t stackHighWaterMarkBytes = 0;
 	bool terminalAccounted = false;
+	bool taskExited = false;
 };
+
+namespace {
+bool isReapableJob(const std::shared_ptr<WorkerJobRecord> &job) {
+	return job && isTerminalState(job->state) && job->taskExited;
+}
+} // namespace
 
 struct WorkerImpl {
 	WorkerConfig config{};
@@ -164,15 +183,28 @@ struct WorkerImpl {
 		);
 	}
 
-	void markFailedAndReap(const std::shared_ptr<WorkerJobRecord> &job) {
+	void reapTerminalJobs() {
+		jobs.erase(
+		    std::remove_if(
+		        jobs.begin(),
+		        jobs.end(),
+		        [](const std::shared_ptr<WorkerJobRecord> &candidate) {
+			        return isReapableJob(candidate);
+		        }
+		    ),
+		    jobs.end()
+		);
+	}
+
+	void markFailed(const std::shared_ptr<WorkerJobRecord> &job) {
 		if (!job) {
 			return;
 		}
 		job->state = WorkerJobState::Failed;
 		job->finishedAtMs = millis();
 		job->taskHandle = nullptr;
+		job->taskExited = true;
 		accountTerminalJob(job);
-		reapJob(job);
 	}
 
 	WorkerResult waitForJob(
@@ -196,7 +228,8 @@ struct WorkerImpl {
 					    jobId
 					);
 				}
-				if (isTerminalState(job->state)) {
+				if (isReapableJob(job)) {
+					reapJob(job);
 					return WorkerResult::success("job finished");
 				}
 			}
@@ -276,7 +309,6 @@ struct WorkerImpl {
 				job->finishedAtMs = millis();
 				job->taskHandle = nullptr;
 				accountTerminalJob(job);
-				reapJob(job);
 			}
 		}
 		if (finalState == WorkerJobState::Stopped) {
@@ -285,6 +317,13 @@ struct WorkerImpl {
 			emitEvent(WorkerEventType::Info, WorkerStatus::Ok, job->id, "job finished");
 		} else {
 			emitEvent(WorkerEventType::Error, WorkerStatus::InternalError, job->id, "job failed");
+		}
+	}
+
+	void markTaskExited(const std::shared_ptr<WorkerJobRecord> &job) {
+		WorkerLock lock(mutex);
+		if (lock && job) {
+			job->taskExited = true;
 		}
 	}
 
@@ -352,18 +391,6 @@ struct WorkerImpl {
 	    bool recurring,
 	    uint32_t intervalMs
 	) {
-		if (!initialized) {
-			return emitJobResult(WorkerJobResult::failure(
-			    WorkerStatus::NotInitialized,
-			    "worker is not initialized"
-			));
-		}
-		if (ending) {
-			return emitJobResult(WorkerJobResult::failure(
-			    WorkerStatus::Busy,
-			    "worker is ending"
-			));
-		}
 		if (!callback) {
 			return emitJobResult(WorkerJobResult::failure(
 			    WorkerStatus::InvalidArgument,
@@ -420,71 +447,70 @@ struct WorkerImpl {
 		job->requestedStackType = jobConfig.stackType;
 		job->actualStackType = actualStackType;
 		if (jobConfig.name != nullptr && *jobConfig.name != '\0') {
-			job->name = jobConfig.name;
-		}
-
-		{
-			WorkerLock lock(mutex);
-			if (!lock) {
-				return emitJobResult(WorkerJobResult::failure(
-				    WorkerStatus::InternalError,
-				    "failed to lock worker registry"
-				));
-			}
-			job->id = nextJobId++;
-			accountCreatedJob(job);
-			jobs.push_back(job);
+			copyTaskName(job->name, sizeof(job->name), jobConfig.name);
 		}
 
 		auto taskArg = new (std::nothrow) std::shared_ptr<WorkerJobRecord>(job);
 		if (taskArg == nullptr) {
-			{
-				WorkerLock lock(mutex);
-				if (lock) {
-					markFailedAndReap(job);
-				}
-			}
 			return emitJobResult(WorkerJobResult::failure(
 			    WorkerStatus::OutOfMemory,
-			    "failed to allocate task argument",
-			    job->id
+			    "failed to allocate task argument"
 			));
 		}
 
 		TaskHandle_t handle = nullptr;
 		bool createdWithCaps = false;
-		const BaseType_t created = worker_task_support::createTask(
-		    &WorkerImpl::taskEntry,
-		    job->name.c_str(),
-		    job->stackSize,
-		    taskArg,
-		    job->priority,
-		    &handle,
-		    job->coreId,
-		    usePsramStack,
-		    createdWithCaps
-		);
-		if (created != pdPASS || handle == nullptr) {
-			delete taskArg;
-			{
-				WorkerLock lock(mutex);
-				if (lock) {
-					markFailedAndReap(job);
-				}
-			}
-			return emitJobResult(WorkerJobResult::failure(
-			    WorkerStatus::TaskCreateFailed,
-			    "failed to create job task",
-			    job->id
-			));
-		}
 
 		{
 			WorkerLock lock(mutex);
-			if (lock) {
-				job->taskHandle = handle;
-				job->createdWithCaps = createdWithCaps;
+			if (!lock) {
+				delete taskArg;
+				return emitJobResult(WorkerJobResult::failure(
+				    WorkerStatus::InternalError,
+				    "failed to lock worker registry"
+				));
 			}
+			if (!initialized) {
+				delete taskArg;
+				return emitJobResult(WorkerJobResult::failure(
+				    WorkerStatus::NotInitialized,
+				    "worker is not initialized"
+				));
+			}
+			if (ending) {
+				delete taskArg;
+				return emitJobResult(WorkerJobResult::failure(
+				    WorkerStatus::Busy,
+				    "worker is ending"
+				));
+			}
+
+			job->id = nextJobId++;
+			accountCreatedJob(job);
+			jobs.push_back(job);
+
+			const BaseType_t created = worker_task_support::createTask(
+			    &WorkerImpl::taskEntry,
+			    job->name,
+			    job->stackSize,
+			    taskArg,
+			    job->priority,
+			    &handle,
+			    job->coreId,
+			    usePsramStack,
+			    createdWithCaps
+			);
+			if (created != pdPASS || handle == nullptr) {
+				delete taskArg;
+				markFailed(job);
+				return emitJobResult(WorkerJobResult::failure(
+				    WorkerStatus::TaskCreateFailed,
+				    "failed to create job task",
+				    job->id
+				));
+			}
+			job->taskHandle = handle;
+			job->createdWithCaps = createdWithCaps;
 		}
 
 		return WorkerJobResult::success(job->id, "job started");
@@ -528,6 +554,7 @@ struct WorkerImpl {
 
 		const bool createdWithCaps = job->createdWithCaps;
 		owner->markTaskFinished(job, finalState);
+		owner->markTaskExited(job);
 		worker_task_support::deleteCurrentTask(createdWithCaps);
 	}
 };
@@ -618,14 +645,19 @@ uint64_t WorkerJobContext::lastRunAtMs() const {
 	return lock ? _record->lastRunAtMs : 0;
 }
 
-Worker::Worker() : _impl(std::make_unique<WorkerImpl>()) {
+Worker::Worker() : _impl(new (std::nothrow) WorkerImpl()) {
 }
 
 Worker::~Worker() {
-	end(2000);
+	if (_impl) {
+		end(UINT32_MAX);
+	}
 }
 
 WorkerResult Worker::init(const WorkerConfig &config) {
+	if (!_impl) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	WorkerResult failure;
 	bool hasFailure = false;
 	{
@@ -660,6 +692,9 @@ WorkerResult Worker::init(const WorkerConfig &config) {
 }
 
 void Worker::onEvent(WorkerEventCallback callback) {
+	if (!_impl) {
+		return;
+	}
 	WorkerLock lock(_impl->mutex);
 	if (lock) {
 		_impl->onEvent = callback;
@@ -667,14 +702,23 @@ void Worker::onEvent(WorkerEventCallback callback) {
 }
 
 WorkerJobResult Worker::once(WorkerCallback callback) {
+	if (!_impl) {
+		return WorkerJobResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	return _impl->startJob(_impl->defaultJobConfig(), callback, false, 0);
 }
 
 WorkerJobResult Worker::once(const WorkerJobConfig &config, WorkerCallback callback) {
+	if (!_impl) {
+		return WorkerJobResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	return _impl->startJob(config, callback, false, 0);
 }
 
 WorkerJobResult Worker::every(uint32_t intervalMs, WorkerCallback callback) {
+	if (!_impl) {
+		return WorkerJobResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	return _impl->startJob(_impl->defaultJobConfig(), callback, true, intervalMs);
 }
 
@@ -683,10 +727,16 @@ WorkerJobResult Worker::every(
     const WorkerJobConfig &config,
     WorkerCallback callback
 ) {
+	if (!_impl) {
+		return WorkerJobResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	return _impl->startJob(config, callback, true, intervalMs);
 }
 
 WorkerResult Worker::stop(WorkerJobId jobId) {
+	if (!_impl) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	TaskHandle_t handle = nullptr;
 	WorkerResult failure;
 	bool hasFailure = false;
@@ -723,6 +773,9 @@ WorkerResult Worker::stop(WorkerJobId jobId) {
 }
 
 WorkerResult Worker::stopAndWait(WorkerJobId jobId, uint32_t timeoutMs) {
+	if (!_impl) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	TaskHandle_t handle = nullptr;
 	std::shared_ptr<WorkerJobRecord> job;
 	WorkerResult failure;
@@ -754,6 +807,9 @@ WorkerResult Worker::stopAndWait(WorkerJobId jobId, uint32_t timeoutMs) {
 }
 
 WorkerResult Worker::sleep(WorkerJobId jobId, uint32_t durationMs) {
+	if (!_impl) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	if (durationMs == 0) {
 		return _impl->emitResult(
 		    WorkerResult::failure(WorkerStatus::InvalidArgument, "sleep duration is required"),
@@ -791,6 +847,9 @@ WorkerResult Worker::waitFor(WorkerJobId jobId) {
 }
 
 WorkerResult Worker::waitFor(WorkerJobId jobId, uint32_t timeoutMs) {
+	if (!_impl) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	std::shared_ptr<WorkerJobRecord> job;
 	{
 		WorkerLock lock(_impl->mutex);
@@ -811,8 +870,23 @@ WorkerResult Worker::waitFor(WorkerJobId jobId, uint32_t timeoutMs) {
 	return _impl->waitForJob(job, jobId, timeoutMs);
 }
 
+WorkerResult Worker::clearFinished() {
+	if (!_impl) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
+	WorkerLock lock(_impl->mutex);
+	if (!lock) {
+		return WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
+	}
+	_impl->reapTerminalJobs();
+	return WorkerResult::success("finished jobs cleared");
+}
+
 WorkerDiag Worker::getDiagnostics() {
 	WorkerDiag diag;
+	if (!_impl) {
+		return diag;
+	}
 	WorkerLock lock(_impl->mutex);
 	if (!lock) {
 		return diag;
@@ -847,6 +921,9 @@ WorkerDiag Worker::getDiagnostics() {
 }
 
 WorkerResult Worker::getJobDiagnostics(WorkerJobId jobId, WorkerJobDiag &out) {
+	if (!_impl) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	WorkerResult failure;
 	bool hasFailure = false;
 	{
@@ -862,7 +939,7 @@ WorkerResult Worker::getJobDiagnostics(WorkerJobId jobId, WorkerJobDiag &out) {
 			} else {
 				out.jobId = job->id;
 				out.state = job->state;
-				out.name = job->name.c_str();
+				out.name = job->name;
 				out.stackSize = job->stackSize;
 				out.priority = job->priority;
 				out.coreId = job->coreId;
@@ -883,6 +960,9 @@ WorkerResult Worker::getJobDiagnostics(WorkerJobId jobId, WorkerJobDiag &out) {
 }
 
 WorkerResult Worker::end(uint32_t timeoutMs) {
+	if (!_impl) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
+	}
 	std::vector<TaskHandle_t> handles;
 	{
 		WorkerLock lock(_impl->mutex);
@@ -913,19 +993,20 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 		bool allFinished = true;
 		{
 			WorkerLock lock(_impl->mutex);
-			if (lock) {
-				for (auto &job : _impl->jobs) {
-					if (job && !isTerminalState(job->state)) {
-						allFinished = false;
-						break;
-					}
+			if (!lock) {
+				return WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
+			}
+			for (auto &job : _impl->jobs) {
+				if (job && !isReapableJob(job)) {
+					allFinished = false;
+					break;
 				}
 			}
 		}
 		if (allFinished) {
 			break;
 		}
-		if (static_cast<uint64_t>(millis()) - startMs >= timeoutMs) {
+		if (timeoutMs != UINT32_MAX && static_cast<uint64_t>(millis()) - startMs >= timeoutMs) {
 			return _impl->emitResult(
 			    WorkerResult::failure(WorkerStatus::Timeout, "worker end timed out")
 			);

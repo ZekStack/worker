@@ -175,6 +175,7 @@ class Worker {
 	WorkerResult sleep(WorkerJobId jobId, uint32_t durationMs);
 	WorkerResult waitFor(WorkerJobId jobId);
 	WorkerResult waitFor(WorkerJobId jobId, uint32_t timeoutMs);
+	WorkerResult clearFinished();
 
 	WorkerDiag getDiagnostics();
 	WorkerResult getJobDiagnostics(WorkerJobId jobId, WorkerJobDiag &out);

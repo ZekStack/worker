@@ -17,7 +17,7 @@
 | `priority` | `0` | `0` uses the worker default. |
 | `coreId` | `tskNO_AFFINITY` | FreeRTOS core affinity. |
 | `stackType` | `WorkerStackType::Auto` | `Auto`, `Internal`, or `Psram`. |
-| `name` | `nullptr` | Optional FreeRTOS task name. |
+| `name` | `nullptr` | Optional FreeRTOS task name. Names are copied into a fixed internal buffer and may be truncated. |
 
 Stack sizes are byte counts on ESP32. Worker rejects stack sizes below 1024 bytes or sizes that are not aligned to `sizeof(StackType_t)`.
 

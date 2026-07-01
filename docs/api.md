@@ -4,7 +4,9 @@ This page summarizes the public API declared in `src/Worker.h`.
 
 ## Results
 
-Worker does not throw exceptions. Operations return `WorkerResult` or `WorkerJobResult`.
+Worker does not intentionally throw exceptions. Operations report normal failures through `WorkerResult` or `WorkerJobResult`.
+
+Catastrophic STL allocation failure while constructing result messages, callbacks, or internal containers is not recoverable by Worker on platforms where the standard library throws or aborts.
 
 | Field | Meaning |
 | --- | --- |
@@ -28,11 +30,12 @@ Worker does not throw exceptions. Operations return `WorkerResult` or `WorkerJob
 | `stop(jobId)` | Request cooperative stop. |
 | `stopAndWait(jobId, timeoutMs)` | Request stop and wait until terminal state. |
 | `sleep(jobId, durationMs)` | Request that a job sleeps. |
-| `waitFor(jobId)` | Wait until a registered job reaches a terminal state. |
-| `waitFor(jobId, timeoutMs)` | Wait with timeout while the job is registered or already being waited on. |
+| `waitFor(jobId)` | Wait until a registered or retained job reaches a terminal state, then reap it. |
+| `waitFor(jobId, timeoutMs)` | Wait with timeout while the job is registered or retained. Reaps the job on successful terminal completion. |
+| `clearFinished()` | Reap retained terminal job records. |
 | `getDiagnostics()` | Return aggregate lifetime diagnostics and current active counts. |
-| `getJobDiagnostics(jobId, out)` | Fill per-job diagnostics for an active registered job. |
-| `end(timeoutMs)` | Stop jobs and end Worker. |
+| `getJobDiagnostics(jobId, out)` | Fill per-job diagnostics for an active or retained terminal job. |
+| `end(timeoutMs)` | Stop jobs and end Worker, returning `Timeout` if callbacks do not finish in time. |
 
 ## Events
 
@@ -62,8 +65,10 @@ Callbacks receive `WorkerJobContext&`.
 
 ## Diagnostics
 
-`WorkerDiag` reports aggregate job counts and stack diagnostics. `totalJobCount`, `finishedJobCount`, `stoppedJobCount`, `failedJobCount`, stack type counts, and total stack high-water data are lifetime counters since `init()`. `runningJobCount` and `sleepingJobCount` describe currently active registered jobs.
+`WorkerDiag` reports aggregate job counts and stack diagnostics. `totalJobCount`, `finishedJobCount`, `stoppedJobCount`, `failedJobCount`, stack type counts, and total stack high-water data are lifetime counters since `init()`. `runningJobCount` and `sleepingJobCount` describe currently active jobs.
 
-Completed job records are reaped automatically after they reach `Finished`, `Stopped`, or `Failed`. `WorkerJobDiag` reports state, name, stack config, run count, timing, and stack high-water data while a job is still registered. After auto-reap, `getJobDiagnostics()` returns `JobNotFound`.
+Completed job records are retained after they reach `Finished`, `Stopped`, or `Failed`. `WorkerJobDiag` reports state, name, stack config, run count, timing, and stack high-water data while a job is active or retained. After `waitFor()` consumes the job, `clearFinished()` reaps it, or Worker ends, `getJobDiagnostics()` returns `JobNotFound`.
 
-`waitFor()` succeeds if it begins while the job is still registered. If a completed job has already been reaped before `waitFor()` starts, it returns `JobNotFound`.
+`waitFor()` is valid for a successful `once()` or `every()` result until the terminal record is consumed or cleared. This makes fast one-off jobs waitable even if they finish before the caller reaches `waitFor()`.
+
+The Worker destructor performs the same cooperative shutdown without a timeout so running tasks cannot continue after Worker internals are destroyed.

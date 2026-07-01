@@ -14,7 +14,7 @@ Worker helps you run one-off and recurring background work in Arduino ESP32 proj
 * **Safe recurring jobs** - `every()` applies the interval delay internally after each callback.
 * **ESP32 task control** - configure byte stack size, priority, core affinity, and stack memory preference.
 * **Cooperative lifecycle** - jobs can stop or sleep through `WorkerJobContext`.
-* **Production-minded** - result-based errors, event callbacks, diagnostics, thread-safe internals, and no exceptions.
+* **Production-minded** - result-based errors, event callbacks, diagnostics, thread-safe internals, and no intentional exceptions.
 
 ## Install
 
@@ -89,12 +89,14 @@ void loop() {
 > [!IMPORTANT]
 > Worker cancellation is cooperative. `stop()` requests that a job stops and wakes it if it is sleeping, but it does not force-delete a running callback.
 
-* A callback that blocks forever will prevent `stopAndWait()` and `end()` from completing before their timeout.
+* A callback that blocks forever will prevent `stopAndWait()` and timed `end()` calls from completing before their timeout. The destructor waits without a timeout so tasks cannot outlive Worker internals.
 * `every(intervalMs, callback)` delays internally after each callback.
-* Completed jobs are reaped automatically. `waitFor()` and per-job diagnostics work while a job is still registered; after reap they return `JobNotFound`.
+* Completed jobs are retained until `waitFor()` consumes them, `clearFinished()` is called, or Worker ends.
 * Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes.
+* Custom task names are copied into a fixed internal buffer and may be truncated.
 * `WorkerStackType::Auto` prefers PSRAM task stacks when supported and falls back to internal RAM.
 * `WorkerEvent::type` clearly identifies `Info`, `Warning`, or `Error` events.
+* Worker APIs use result objects for normal failures. Catastrophic STL allocation failure while constructing result messages, callbacks, or internal containers is not recoverable by Worker on platforms where the standard library throws or aborts.
 
 ## Examples
 
@@ -142,6 +144,7 @@ WorkerJobDiag jobDiag;
 worker.getJobDiagnostics(loop.jobId, jobDiag);
 
 worker.stopAndWait(loop.jobId, 2000);
+worker.clearFinished();
 ```
 
 For the full API, see [`docs/api.md`](docs/api.md).

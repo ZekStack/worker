@@ -18,7 +18,7 @@ Shows `ctx.sleep()`, external `worker.sleep(jobId, durationMs)`, `waitFor()`, an
 
 ## Diagnostics
 
-Shows aggregate `getDiagnostics()` counters and `getJobDiagnostics()` for an active registered job. Completed jobs are reaped automatically, so per-job diagnostics return `JobNotFound` after the job reaches a terminal state.
+Shows aggregate `getDiagnostics()` counters and `getJobDiagnostics()` for a job. Completed jobs remain available for diagnostics until `waitFor()` consumes them, `clearFinished()` is called, or Worker ends.
 
 ## BindableCallbacks
 
