@@ -28,10 +28,10 @@ Worker does not throw exceptions. Operations return `WorkerResult` or `WorkerJob
 | `stop(jobId)` | Request cooperative stop. |
 | `stopAndWait(jobId, timeoutMs)` | Request stop and wait until terminal state. |
 | `sleep(jobId, durationMs)` | Request that a job sleeps. |
-| `waitFor(jobId)` | Wait until the job reaches a terminal state. |
-| `waitFor(jobId, timeoutMs)` | Wait with timeout. |
-| `getDiagnostics()` | Return aggregate diagnostics. |
-| `getJobDiagnostics(jobId, out)` | Fill per-job diagnostics. |
+| `waitFor(jobId)` | Wait until a registered job reaches a terminal state. |
+| `waitFor(jobId, timeoutMs)` | Wait with timeout while the job is registered or already being waited on. |
+| `getDiagnostics()` | Return aggregate lifetime diagnostics and current active counts. |
+| `getJobDiagnostics(jobId, out)` | Fill per-job diagnostics for an active registered job. |
 | `end(timeoutMs)` | Stop jobs and end Worker. |
 
 ## Events
@@ -62,6 +62,8 @@ Callbacks receive `WorkerJobContext&`.
 
 ## Diagnostics
 
-`WorkerDiag` reports aggregate job counts and stack diagnostics. `WorkerJobDiag` reports state, name, stack config, run count, timing, and stack high-water data for one job.
+`WorkerDiag` reports aggregate job counts and stack diagnostics. `totalJobCount`, `finishedJobCount`, `stoppedJobCount`, `failedJobCount`, stack type counts, and total stack high-water data are lifetime counters since `init()`. `runningJobCount` and `sleepingJobCount` describe currently active registered jobs.
 
-Completed job records stay available for diagnostics until `end()`.
+Completed job records are reaped automatically after they reach `Finished`, `Stopped`, or `Failed`. `WorkerJobDiag` reports state, name, stack config, run count, timing, and stack high-water data while a job is still registered. After auto-reap, `getJobDiagnostics()` returns `JobNotFound`.
+
+`waitFor()` succeeds if it begins while the job is still registered. If a completed job has already been reaped before `waitFor()` starts, it returns `JobNotFound`.

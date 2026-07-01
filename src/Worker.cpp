@@ -41,6 +41,7 @@ struct WorkerJobRecord {
 	uint64_t finishedAtMs = 0;
 	uint64_t sleepUntilMs = 0;
 	size_t stackHighWaterMarkBytes = 0;
+	bool terminalAccounted = false;
 };
 
 struct WorkerImpl {
@@ -51,6 +52,13 @@ struct WorkerImpl {
 	bool initialized = false;
 	bool ending = false;
 	WorkerJobId nextJobId = 1;
+	uint32_t totalJobCount = 0;
+	uint32_t finishedJobCount = 0;
+	uint32_t stoppedJobCount = 0;
+	uint32_t failedJobCount = 0;
+	uint32_t psramStackJobCount = 0;
+	uint32_t internalStackJobCount = 0;
+	size_t terminalStackHighWaterMarkBytes = 0;
 
 	WorkerResult emitResult(WorkerResult result, WorkerJobId jobId = kInvalidJobId) {
 		if (!result) {
@@ -92,6 +100,115 @@ struct WorkerImpl {
 			}
 		}
 		return nullptr;
+	}
+
+	void resetDiagnostics() {
+		totalJobCount = 0;
+		finishedJobCount = 0;
+		stoppedJobCount = 0;
+		failedJobCount = 0;
+		psramStackJobCount = 0;
+		internalStackJobCount = 0;
+		terminalStackHighWaterMarkBytes = 0;
+	}
+
+	void accountCreatedJob(const std::shared_ptr<WorkerJobRecord> &job) {
+		if (!job) {
+			return;
+		}
+		totalJobCount++;
+		if (job->actualStackType == WorkerStackType::Psram) {
+			psramStackJobCount++;
+		} else {
+			internalStackJobCount++;
+		}
+	}
+
+	void accountTerminalJob(const std::shared_ptr<WorkerJobRecord> &job) {
+		if (!job || job->terminalAccounted) {
+			return;
+		}
+		job->terminalAccounted = true;
+		switch (job->state) {
+		case WorkerJobState::Finished:
+			finishedJobCount++;
+			break;
+		case WorkerJobState::Stopped:
+			stoppedJobCount++;
+			break;
+		case WorkerJobState::Failed:
+			failedJobCount++;
+			break;
+		case WorkerJobState::Created:
+		case WorkerJobState::Running:
+		case WorkerJobState::Sleeping:
+		case WorkerJobState::Stopping:
+			break;
+		}
+		terminalStackHighWaterMarkBytes += job->stackHighWaterMarkBytes;
+	}
+
+	void reapJob(const std::shared_ptr<WorkerJobRecord> &job) {
+		if (!job) {
+			return;
+		}
+		jobs.erase(
+		    std::remove_if(
+		        jobs.begin(),
+		        jobs.end(),
+		        [&](const std::shared_ptr<WorkerJobRecord> &candidate) {
+			        return candidate && candidate->id == job->id;
+		        }
+		    ),
+		    jobs.end()
+		);
+	}
+
+	void markFailedAndReap(const std::shared_ptr<WorkerJobRecord> &job) {
+		if (!job) {
+			return;
+		}
+		job->state = WorkerJobState::Failed;
+		job->finishedAtMs = millis();
+		job->taskHandle = nullptr;
+		accountTerminalJob(job);
+		reapJob(job);
+	}
+
+	WorkerResult waitForJob(
+	    const std::shared_ptr<WorkerJobRecord> &job,
+	    WorkerJobId jobId,
+	    uint32_t timeoutMs
+	) {
+		if (!job) {
+			return emitResult(
+			    WorkerResult::failure(WorkerStatus::JobNotFound, "job not found"),
+			    jobId
+			);
+		}
+		const uint64_t startMs = millis();
+		while (true) {
+			{
+				WorkerLock lock(mutex);
+				if (!lock) {
+					return emitResult(
+					    WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker"),
+					    jobId
+					);
+				}
+				if (isTerminalState(job->state)) {
+					return WorkerResult::success("job finished");
+				}
+			}
+
+			if (timeoutMs != UINT32_MAX && static_cast<uint64_t>(millis()) - startMs >= timeoutMs) {
+				return emitResult(
+				    WorkerResult::failure(WorkerStatus::Timeout, "wait timed out"),
+				    jobId
+				);
+			}
+			vTaskDelay(pdMS_TO_TICKS(kWaitPollMs));
+		}
 	}
 
 	WorkerJobConfig defaultJobConfig() const {
@@ -158,6 +275,8 @@ struct WorkerImpl {
 				job->state = finalState;
 				job->finishedAtMs = millis();
 				job->taskHandle = nullptr;
+				accountTerminalJob(job);
+				reapJob(job);
 			}
 		}
 		if (finalState == WorkerJobState::Stopped) {
@@ -313,6 +432,7 @@ struct WorkerImpl {
 				));
 			}
 			job->id = nextJobId++;
+			accountCreatedJob(job);
 			jobs.push_back(job);
 		}
 
@@ -321,8 +441,7 @@ struct WorkerImpl {
 			{
 				WorkerLock lock(mutex);
 				if (lock) {
-					job->state = WorkerJobState::Failed;
-					job->finishedAtMs = millis();
+					markFailedAndReap(job);
 				}
 			}
 			return emitJobResult(WorkerJobResult::failure(
@@ -350,8 +469,7 @@ struct WorkerImpl {
 			{
 				WorkerLock lock(mutex);
 				if (lock) {
-					job->state = WorkerJobState::Failed;
-					job->finishedAtMs = millis();
+					markFailedAndReap(job);
 				}
 			}
 			return emitJobResult(WorkerJobResult::failure(
@@ -529,6 +647,9 @@ WorkerResult Worker::init(const WorkerConfig &config) {
 			_impl->config = config;
 			_impl->initialized = true;
 			_impl->ending = false;
+			_impl->nextJobId = 1;
+			_impl->jobs.clear();
+			_impl->resetDiagnostics();
 		}
 	}
 	if (hasFailure) {
@@ -602,11 +723,34 @@ WorkerResult Worker::stop(WorkerJobId jobId) {
 }
 
 WorkerResult Worker::stopAndWait(WorkerJobId jobId, uint32_t timeoutMs) {
-	WorkerResult stopResult = stop(jobId);
-	if (!stopResult) {
-		return stopResult;
+	TaskHandle_t handle = nullptr;
+	std::shared_ptr<WorkerJobRecord> job;
+	WorkerResult failure;
+	bool hasFailure = false;
+	{
+		WorkerLock lock(_impl->mutex);
+		if (!lock) {
+			failure = WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
+			hasFailure = true;
+		} else {
+			job = _impl->findJob(jobId);
+			if (!job) {
+				failure = WorkerResult::failure(WorkerStatus::JobNotFound, "job not found");
+				hasFailure = true;
+			} else if (!isTerminalState(job->state)) {
+				job->stopRequested.store(true);
+				job->state = WorkerJobState::Stopping;
+				handle = job->taskHandle;
+			}
+		}
 	}
-	return waitFor(jobId, timeoutMs);
+	if (hasFailure) {
+		return _impl->emitResult(failure, jobId);
+	}
+	if (handle != nullptr) {
+		xTaskNotifyGive(handle);
+	}
+	return _impl->waitForJob(job, jobId, timeoutMs);
 }
 
 WorkerResult Worker::sleep(WorkerJobId jobId, uint32_t durationMs) {
@@ -647,34 +791,24 @@ WorkerResult Worker::waitFor(WorkerJobId jobId) {
 }
 
 WorkerResult Worker::waitFor(WorkerJobId jobId, uint32_t timeoutMs) {
-	const uint64_t startMs = millis();
-	while (true) {
-		{
-			WorkerLock lock(_impl->mutex);
-			if (!lock) {
-				return _impl->emitResult(
-				    WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker"),
-				    jobId
-				);
-			}
-			auto job = _impl->findJob(jobId);
-			if (!job) {
-				break;
-			}
-			if (isTerminalState(job->state)) {
-				return WorkerResult::success("job finished");
-			}
-		}
-
-		if (timeoutMs != UINT32_MAX && static_cast<uint64_t>(millis()) - startMs >= timeoutMs) {
+	std::shared_ptr<WorkerJobRecord> job;
+	{
+		WorkerLock lock(_impl->mutex);
+		if (!lock) {
 			return _impl->emitResult(
-			    WorkerResult::failure(WorkerStatus::Timeout, "wait timed out"),
+			    WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker"),
 			    jobId
 			);
 		}
-		vTaskDelay(pdMS_TO_TICKS(kWaitPollMs));
+		job = _impl->findJob(jobId);
+		if (!job) {
+			return _impl->emitResult(
+			    WorkerResult::failure(WorkerStatus::JobNotFound, "job not found"),
+			    jobId
+			);
+		}
 	}
-	return _impl->emitResult(WorkerResult::failure(WorkerStatus::JobNotFound, "job not found"), jobId);
+	return _impl->waitForJob(job, jobId, timeoutMs);
 }
 
 WorkerDiag Worker::getDiagnostics() {
@@ -683,7 +817,13 @@ WorkerDiag Worker::getDiagnostics() {
 	if (!lock) {
 		return diag;
 	}
-	diag.totalJobCount = static_cast<uint32_t>(_impl->jobs.size());
+	diag.totalJobCount = _impl->totalJobCount;
+	diag.finishedJobCount = _impl->finishedJobCount;
+	diag.stoppedJobCount = _impl->stoppedJobCount;
+	diag.failedJobCount = _impl->failedJobCount;
+	diag.psramStackJobCount = _impl->psramStackJobCount;
+	diag.internalStackJobCount = _impl->internalStackJobCount;
+	diag.totalStackHighWaterMarkBytes = _impl->terminalStackHighWaterMarkBytes;
 	for (const auto &job : _impl->jobs) {
 		if (!job) {
 			continue;
@@ -695,25 +835,13 @@ WorkerDiag Worker::getDiagnostics() {
 		case WorkerJobState::Sleeping:
 			diag.sleepingJobCount++;
 			break;
-		case WorkerJobState::Finished:
-			diag.finishedJobCount++;
-			break;
-		case WorkerJobState::Stopped:
-		case WorkerJobState::Stopping:
-			diag.stoppedJobCount++;
-			break;
-		case WorkerJobState::Failed:
-			diag.failedJobCount++;
-			break;
 		case WorkerJobState::Created:
+		case WorkerJobState::Stopping:
+		case WorkerJobState::Stopped:
+		case WorkerJobState::Finished:
+		case WorkerJobState::Failed:
 			break;
 		}
-		if (job->actualStackType == WorkerStackType::Psram) {
-			diag.psramStackJobCount++;
-		} else {
-			diag.internalStackJobCount++;
-		}
-		diag.totalStackHighWaterMarkBytes += job->stackHighWaterMarkBytes;
 	}
 	return diag;
 }
@@ -812,6 +940,7 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 			_impl->nextJobId = 1;
 			_impl->initialized = false;
 			_impl->ending = false;
+			_impl->resetDiagnostics();
 		}
 	}
 	_impl->emitEvent(WorkerEventType::Info, WorkerStatus::Ok, kInvalidJobId, "worker ended");

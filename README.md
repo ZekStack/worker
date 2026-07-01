@@ -91,6 +91,7 @@ void loop() {
 
 * A callback that blocks forever will prevent `stopAndWait()` and `end()` from completing before their timeout.
 * `every(intervalMs, callback)` delays internally after each callback.
+* Completed jobs are reaped automatically. `waitFor()` and per-job diagnostics work while a job is still registered; after reap they return `JobNotFound`.
 * Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes.
 * `WorkerStackType::Auto` prefers PSRAM task stacks when supported and falls back to internal RAM.
 * `WorkerEvent::type` clearly identifies `Info`, `Warning`, or `Error` events.
@@ -103,7 +104,7 @@ void loop() {
 | `JobConfig` | Stack size, priority, core affinity, internal stack, and PSRAM stack request. |
 | `Events` | Event callback and error event handling. |
 | `SleepAndWait` | Context sleep, external sleep, wait, and timeout behavior. |
-| `Diagnostics` | Global and per-job diagnostics. |
+| `Diagnostics` | Aggregate diagnostics and active per-job diagnostics. |
 | `BindableCallbacks` | `std::bind` with private class methods. |
 
 Start with:
@@ -135,11 +136,12 @@ WorkerJobResult once = worker.once([](WorkerJobContext &ctx) {});
 WorkerJobResult loop = worker.every(1000, [](WorkerJobContext &ctx) {});
 
 worker.sleep(loop.jobId, 5000);
-worker.stopAndWait(loop.jobId, 2000);
 
 WorkerDiag diag = worker.getDiagnostics();
 WorkerJobDiag jobDiag;
 worker.getJobDiagnostics(loop.jobId, jobDiag);
+
+worker.stopAndWait(loop.jobId, 2000);
 ```
 
 For the full API, see [`docs/api.md`](docs/api.md).

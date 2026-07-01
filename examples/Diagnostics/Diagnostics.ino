@@ -6,7 +6,7 @@ WorkerJobId jobId = 0;
 
 void printDiagnostics() {
 	WorkerDiag diag = worker.getDiagnostics();
-	Serial.printf("jobs=%u running=%u sleeping=%u finished=%u stopped=%u failed=%u\n",
+	Serial.printf("created=%u running=%u sleeping=%u finished=%u stopped=%u failed=%u\n",
 	    static_cast<unsigned>(diag.totalJobCount),
 	    static_cast<unsigned>(diag.runningJobCount),
 	    static_cast<unsigned>(diag.sleepingJobCount),
@@ -22,6 +22,8 @@ void printDiagnostics() {
 		    jobDiag.name,
 		    static_cast<unsigned>(jobDiag.runCount),
 		    static_cast<unsigned>(jobDiag.stackSize));
+	} else {
+		Serial.printf("job diagnostics unavailable: %s\n", result.message.c_str());
 	}
 }
 
@@ -46,6 +48,7 @@ void setup() {
 
 	if (result) {
 		jobId = result.jobId;
+		printDiagnostics();
 		worker.waitFor(jobId, 5000);
 		printDiagnostics();
 	}
