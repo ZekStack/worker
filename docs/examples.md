@@ -23,3 +23,7 @@ Shows aggregate `getDiagnostics()` counters and `getJobDiagnostics()` for a job.
 ## BindableCallbacks
 
 Shows `std::bind` with private class methods, so application classes can own job behavior.
+
+## TaskCleanupSentinel
+
+Shows a runtime sentinel for verifying callback captures and task-entry RAII objects are cleaned up before `waitFor()` returns.

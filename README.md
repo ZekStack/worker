@@ -108,6 +108,7 @@ void loop() {
 | `SleepAndWait` | Context sleep, external sleep, wait, and timeout behavior. |
 | `Diagnostics` | Aggregate diagnostics and active per-job diagnostics. |
 | `BindableCallbacks` | `std::bind` with private class methods. |
+| `TaskCleanupSentinel` | Runtime sentinel for verifying task-entry C++ cleanup before `waitFor()` returns. |
 
 Start with:
 

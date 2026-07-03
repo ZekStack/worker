@@ -81,6 +81,12 @@ struct WorkerJobRecord {
 	bool taskExited = false;
 };
 
+struct TaskEntryExit {
+	bool createdWithCaps = false;
+	WorkerImpl *owner = nullptr;
+	WorkerJobId jobId = kInvalidJobId;
+};
+
 namespace {
 bool isReapableJob(const std::shared_ptr<WorkerJobRecord> &job) {
 	return job && isTerminalState(job->state) && job->taskExited;
@@ -252,10 +258,8 @@ struct WorkerImpl {
 					    jobId
 					);
 				}
-				if (isTerminalState(job->state)) {
-					if (job->taskExited) {
-						reapJob(job);
-					}
+				if (isTerminalState(job->state) && job->taskExited) {
+					reapJob(job);
 					return WorkerResult::success("job finished");
 				}
 			}
@@ -347,9 +351,13 @@ struct WorkerImpl {
 		}
 	}
 
-	void markTaskExited(const std::shared_ptr<WorkerJobRecord> &job) {
+	void markTaskExited(WorkerJobId jobId) {
 		WorkerLock lock(mutex);
-		if (lock && job) {
+		if (!lock) {
+			return;
+		}
+		auto job = findJob(jobId);
+		if (job) {
 			job->taskExited = true;
 		}
 	}
@@ -550,21 +558,26 @@ struct WorkerImpl {
 		return WorkerJobResult::success(job->id, "job started");
 	}
 
-	static void taskEntry(void *arg) {
+	static TaskEntryExit runTaskEntry(void *arg) {
+		TaskEntryExit exit;
 		std::unique_ptr<std::shared_ptr<WorkerJobRecord>> holder(
 		    static_cast<std::shared_ptr<WorkerJobRecord> *>(arg)
 		);
 		if (!holder || !(*holder)) {
-			vTaskDelete(nullptr);
-			return;
+			// Defensive only: stack allocation caps are unknowable without a valid task arg.
+			return exit;
 		}
 
 		auto job = *holder;
+		exit.createdWithCaps = job->createdWithCaps;
+
 		WorkerImpl *owner = job->owner;
 		if (owner == nullptr) {
-			vTaskDelete(nullptr);
-			return;
+			return exit;
 		}
+
+		exit.owner = owner;
+		exit.jobId = job->id;
 
 		WorkerJobContext context(job);
 		WorkerJobState finalState = WorkerJobState::Finished;
@@ -582,13 +595,20 @@ struct WorkerImpl {
 		} else {
 			owner->markRunStart(job);
 			job->callback(context);
-			finalState = job->stopRequested.load() ? WorkerJobState::Stopped : WorkerJobState::Finished;
+			finalState =
+			    job->stopRequested.load() ? WorkerJobState::Stopped : WorkerJobState::Finished;
 		}
 
-		const bool createdWithCaps = job->createdWithCaps;
 		owner->markTaskFinished(job, finalState);
-		owner->markTaskExited(job);
-		worker_task_support::deleteCurrentTask(createdWithCaps);
+		return exit;
+	}
+
+	static void taskEntry(void *arg) {
+		const TaskEntryExit exit = runTaskEntry(arg);
+		if (exit.owner != nullptr && exit.jobId != kInvalidJobId) {
+			exit.owner->markTaskExited(exit.jobId);
+		}
+		worker_task_support::deleteCurrentTask(exit.createdWithCaps);
 	}
 };
 

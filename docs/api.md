@@ -28,10 +28,10 @@ Catastrophic STL allocation failure while constructing result messages, callback
 | `every(intervalMs, callback)` | Start a recurring task with internal delay. |
 | `every(intervalMs, config, callback)` | Start a configured recurring task. |
 | `stop(jobId)` | Request cooperative stop. |
-| `stopAndWait(jobId, timeoutMs)` | Request stop and wait until terminal state. |
+| `stopAndWait(jobId, timeoutMs)` | Request stop and wait until terminal state and task cleanup. |
 | `sleep(jobId, durationMs)` | Request that a job sleeps. |
-| `waitFor(jobId)` | Wait until a registered or retained job reaches a terminal state. Reaps it only after task cleanup has completed. |
-| `waitFor(jobId, timeoutMs)` | Wait with timeout while the job is registered or retained. Reaps it only after task cleanup has completed. |
+| `waitFor(jobId)` | Wait until a registered or retained job reaches terminal state and task cleanup. |
+| `waitFor(jobId, timeoutMs)` | Wait with timeout until terminal state and task cleanup. |
 | `clearFinished()` | Reap retained terminal job records. |
 | `getDiagnostics()` | Return aggregate lifetime diagnostics and current active counts. |
 | `getJobDiagnostics(jobId, out)` | Fill per-job diagnostics for an active or retained terminal job. |
@@ -69,6 +69,6 @@ Callbacks receive `WorkerJobContext&`.
 
 Completed job records are retained after they reach `Finished`, `Stopped`, or `Failed`. `WorkerJobDiag` reports state, name, stack config, run count, timing, and stack high-water data while a job is active or retained. After `waitFor()` consumes the job following task cleanup, `clearFinished()` reaps it, or Worker ends, `getJobDiagnostics()` returns `JobNotFound`.
 
-`waitFor()` is valid for a successful `once()` or `every()` result until the terminal record is consumed or cleared. It returns when the job reaches a terminal state, even if it is called from the synchronous terminal event callback before final task cleanup. This makes fast one-off jobs waitable even if they finish before the caller reaches `waitFor()`.
+`waitFor()` and `stopAndWait()` return success only after the job has reached a terminal state and its task entry has completed C++ cleanup. Callback captures and task-entry RAII objects have been released before the job is reaped.
 
 The Worker destructor performs the same cooperative shutdown without a timeout so running tasks cannot continue after Worker internals are destroyed.
