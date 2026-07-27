@@ -8,12 +8,19 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <utility>
 #include <vector>
+
+extern "C" {
+#include <freertos/queue.h>
+}
 
 namespace {
 constexpr WorkerJobId kInvalidJobId = 0;
 constexpr uint32_t kWaitPollMs = 10;
 constexpr size_t kMaxTaskNameLength = 32;
+constexpr size_t kCompletionCapacity = 16;
+constexpr const char *kCleanupTaskName = "worker-cleanup";
 
 uint32_t nowMs() {
 	return static_cast<uint32_t>(millis());
@@ -36,12 +43,23 @@ TickType_t waitTicks(uint32_t durationMs) {
 	return durationMs == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(durationMs);
 }
 
-bool isTerminalState(WorkerJobState state) {
-	return state == WorkerJobState::Stopped || state == WorkerJobState::Finished ||
-	       state == WorkerJobState::Failed;
+bool isExecutionCompleteState(WorkerJobState state) {
+	switch (state) {
+	case WorkerJobState::CallbackComplete:
+	case WorkerJobState::CleanupQueued:
+	case WorkerJobState::CleanupComplete:
+	case WorkerJobState::Stopped:
+	case WorkerJobState::Finished:
+	case WorkerJobState::Failed:
+		return true;
+	case WorkerJobState::Created:
+	case WorkerJobState::Running:
+	case WorkerJobState::Sleeping:
+	case WorkerJobState::Stopping:
+		return false;
+	}
+	return false;
 }
-
-bool isReapableJob(const std::shared_ptr<WorkerJobRecord> &job);
 
 void copyTaskName(char *destination, size_t destinationSize, const char *source) {
 	if (destination == nullptr || destinationSize == 0 || source == nullptr || *source == '\0') {
@@ -51,6 +69,11 @@ void copyTaskName(char *destination, size_t destinationSize, const char *source)
 	destination[destinationSize - 1] = '\0';
 }
 } // namespace
+
+enum class WorkerTaskAllocation : uint8_t {
+	Internal,
+	WithCaps,
+};
 
 struct WorkerJobRecord {
 	WorkerImpl *owner = nullptr;
@@ -64,10 +87,12 @@ struct WorkerJobRecord {
 	BaseType_t coreId = tskNO_AFFINITY;
 	WorkerStackType requestedStackType = WorkerStackType::Auto;
 	WorkerStackType actualStackType = WorkerStackType::Internal;
+	WorkerTaskAllocation allocation = WorkerTaskAllocation::Internal;
 	TaskHandle_t taskHandle = nullptr;
-	bool createdWithCaps = false;
 	std::atomic<bool> stopRequested{false};
+	std::atomic<bool> readyForDelete{false};
 	WorkerJobState state = WorkerJobState::Created;
+	WorkerJobState finalState = WorkerJobState::Finished;
 	bool hasStarted = false;
 	uint32_t runCount = 0;
 	uint32_t startedAtMs = 0;
@@ -77,37 +102,36 @@ struct WorkerJobRecord {
 	uint32_t sleepDurationMs = 0;
 	bool hasSleepDeadline = false;
 	size_t stackHighWaterMarkBytes = 0;
-	bool terminalAccounted = false;
-	bool taskExited = false;
 };
 
-struct TaskEntryExit {
-	bool createdWithCaps = false;
-	WorkerImpl *owner = nullptr;
+struct WorkerCompletion {
 	WorkerJobId jobId = kInvalidJobId;
+	WorkerJobState finalState = WorkerJobState::Finished;
 };
 
-namespace {
-bool isReapableJob(const std::shared_ptr<WorkerJobRecord> &job) {
-	return job && isTerminalState(job->state) && job->taskExited;
-}
-} // namespace
+struct WorkerCleanupRequest {
+	WorkerJobId jobId = kInvalidJobId;
+	TaskHandle_t taskHandle = nullptr;
+	WorkerJobRecord *record = nullptr;
+	bool withCaps = false;
+	bool stopCleanupTask = false;
+};
 
 struct WorkerImpl {
 	WorkerConfig config{};
 	WorkerMutex mutex;
-	std::vector<std::shared_ptr<WorkerJobRecord>> jobs;
+	std::vector<std::unique_ptr<WorkerJobRecord>> jobs;
+	std::vector<WorkerCompletion> completions;
 	WorkerEventCallback onEvent;
+	QueueHandle_t cleanupQueue = nullptr;
+	TaskHandle_t cleanupTaskHandle = nullptr;
+	bool cleanupTaskRunning = false;
+	bool cleanupTaskStopRequested = false;
+	std::atomic<bool> cleanupTaskReadyForDelete{false};
+	uint32_t cleanupQueueHighWaterMark = 0;
 	bool initialized = false;
 	bool ending = false;
 	WorkerJobId nextJobId = 1;
-	uint32_t totalJobCount = 0;
-	uint32_t finishedJobCount = 0;
-	uint32_t stoppedJobCount = 0;
-	uint32_t failedJobCount = 0;
-	uint32_t psramStackJobCount = 0;
-	uint32_t internalStackJobCount = 0;
-	size_t terminalStackHighWaterMarkBytes = 0;
 
 	WorkerResult emitResult(WorkerResult result, WorkerJobId jobId = kInvalidJobId) {
 		if (!result) {
@@ -142,114 +166,87 @@ struct WorkerImpl {
 		}
 	}
 
-	std::shared_ptr<WorkerJobRecord> findJob(WorkerJobId jobId) {
+	WorkerJobRecord *findJob(WorkerJobId jobId) {
 		for (auto &job : jobs) {
 			if (job && job->id == jobId) {
-				return job;
+				return job.get();
 			}
 		}
 		return nullptr;
 	}
 
-	void resetDiagnostics() {
-		totalJobCount = 0;
-		finishedJobCount = 0;
-		stoppedJobCount = 0;
-		failedJobCount = 0;
-		psramStackJobCount = 0;
-		internalStackJobCount = 0;
-		terminalStackHighWaterMarkBytes = 0;
+	bool hasCompletion(WorkerJobId jobId) const {
+		return std::any_of(
+		    completions.begin(),
+		    completions.end(),
+		    [jobId](const WorkerCompletion &completion) { return completion.jobId == jobId; }
+		);
 	}
 
-	void accountCreatedJob(const std::shared_ptr<WorkerJobRecord> &job) {
-		if (!job) {
-			return;
+	bool consumeCompletion(WorkerJobId jobId, WorkerJobState &finalState) {
+		auto it = std::find_if(
+		    completions.begin(),
+		    completions.end(),
+		    [jobId](const WorkerCompletion &completion) { return completion.jobId == jobId; }
+		);
+		if (it == completions.end()) {
+			return false;
 		}
-		totalJobCount++;
-		if (job->actualStackType == WorkerStackType::Psram) {
-			psramStackJobCount++;
-		} else {
-			internalStackJobCount++;
-		}
+		finalState = it->finalState;
+		completions.erase(it);
+		return true;
 	}
 
-	void accountTerminalJob(const std::shared_ptr<WorkerJobRecord> &job) {
-		if (!job || job->terminalAccounted) {
-			return;
+	void recordCompletion(WorkerJobId jobId, WorkerJobState finalState) {
+		completions.erase(
+		    std::remove_if(
+		        completions.begin(),
+		        completions.end(),
+		        [jobId](const WorkerCompletion &completion) { return completion.jobId == jobId; }
+		    ),
+		    completions.end()
+		);
+		if (completions.size() >= kCompletionCapacity) {
+			completions.erase(completions.begin());
 		}
-		job->terminalAccounted = true;
-		switch (job->state) {
-		case WorkerJobState::Finished:
-			finishedJobCount++;
-			break;
-		case WorkerJobState::Stopped:
-			stoppedJobCount++;
-			break;
-		case WorkerJobState::Failed:
-			failedJobCount++;
-			break;
-		case WorkerJobState::Created:
-		case WorkerJobState::Running:
-		case WorkerJobState::Sleeping:
-		case WorkerJobState::Stopping:
-			break;
-		}
-		terminalStackHighWaterMarkBytes += job->stackHighWaterMarkBytes;
+		completions.push_back(WorkerCompletion{jobId, finalState});
 	}
 
-	void reapJob(const std::shared_ptr<WorkerJobRecord> &job) {
-		if (!job) {
-			return;
-		}
+	void eraseJob(WorkerJobId jobId) {
 		jobs.erase(
 		    std::remove_if(
 		        jobs.begin(),
 		        jobs.end(),
-		        [&](const std::shared_ptr<WorkerJobRecord> &candidate) {
-			        return candidate && candidate->id == job->id;
+		        [jobId](const std::unique_ptr<WorkerJobRecord> &job) {
+			        return job && job->id == jobId;
 		        }
 		    ),
 		    jobs.end()
 		);
 	}
 
-	void reapTerminalJobs() {
-		jobs.erase(
-		    std::remove_if(
-		        jobs.begin(),
-		        jobs.end(),
-		        [](const std::shared_ptr<WorkerJobRecord> &candidate) {
-			        return isReapableJob(candidate);
-		        }
-		    ),
-		    jobs.end()
+	WorkerJobId allocateJobId() {
+		WorkerJobId id = nextJobId++;
+		if (id == kInvalidJobId) {
+			id = nextJobId++;
+		}
+		return id;
+	}
+
+	WorkerResult completionResult(WorkerJobState finalState) {
+		if (finalState == WorkerJobState::Failed) {
+			return WorkerResult::failure(WorkerStatus::InternalError, "job failed");
+		}
+		return WorkerResult::success(
+		    finalState == WorkerJobState::Stopped ? "job stopped" : "job finished"
 		);
 	}
 
-	void markFailed(const std::shared_ptr<WorkerJobRecord> &job) {
-		if (!job) {
-			return;
-		}
-		job->state = WorkerJobState::Failed;
-		job->finishedAtMs = nowMs();
-		job->taskHandle = nullptr;
-		job->taskExited = true;
-		accountTerminalJob(job);
-	}
-
-	WorkerResult waitForJob(
-	    const std::shared_ptr<WorkerJobRecord> &job,
-	    WorkerJobId jobId,
-	    uint32_t timeoutMs
-	) {
-		if (!job) {
-			return emitResult(
-			    WorkerResult::failure(WorkerStatus::JobNotFound, "job not found"),
-			    jobId
-			);
-		}
+	WorkerResult waitForJobId(WorkerJobId jobId, uint32_t timeoutMs) {
 		const uint32_t startMs = nowMs();
 		while (true) {
+			WorkerJobState finalState = WorkerJobState::Failed;
+			bool foundActive = false;
 			{
 				WorkerLock lock(mutex);
 				if (!lock) {
@@ -258,12 +255,18 @@ struct WorkerImpl {
 					    jobId
 					);
 				}
-				if (isTerminalState(job->state) && job->taskExited) {
-					reapJob(job);
-					return WorkerResult::success("job finished");
+				if (consumeCompletion(jobId, finalState)) {
+					return completionResult(finalState);
 				}
+				foundActive = findJob(jobId) != nullptr;
 			}
 
+			if (!foundActive) {
+				return emitResult(
+				    WorkerResult::failure(WorkerStatus::JobNotFound, "job not found"),
+				    jobId
+				);
+			}
 			if (elapsedSince(startMs, timeoutMs)) {
 				return emitResult(
 				    WorkerResult::failure(WorkerStatus::Timeout, "wait timed out"),
@@ -294,24 +297,9 @@ struct WorkerImpl {
 		return resolved;
 	}
 
-	void setState(
-	    const std::shared_ptr<WorkerJobRecord> &job,
-	    WorkerJobState state,
-	    bool updateFinishTime = false
-	) {
+	void markRunStart(WorkerJobRecord *job) {
 		WorkerLock lock(mutex);
-		if (!lock || !job) {
-			return;
-		}
-		job->state = state;
-		if (updateFinishTime) {
-			job->finishedAtMs = nowMs();
-		}
-	}
-
-	void markRunStart(const std::shared_ptr<WorkerJobRecord> &job) {
-		WorkerLock lock(mutex);
-		if (!lock || !job) {
+		if (!lock || job == nullptr) {
 			return;
 		}
 		const uint32_t currentMs = nowMs();
@@ -324,53 +312,15 @@ struct WorkerImpl {
 		job->state = WorkerJobState::Running;
 	}
 
-	void markTaskFinished(
-	    const std::shared_ptr<WorkerJobRecord> &job,
-	    WorkerJobState finalState
-	) {
-		if (!job) {
-			return;
-		}
-		{
-			WorkerLock lock(mutex);
-			if (lock) {
-				job->stackHighWaterMarkBytes =
-				    worker_task_support::currentStackHighWaterMarkBytes();
-				job->state = finalState;
-				job->finishedAtMs = nowMs();
-				job->taskHandle = nullptr;
-				accountTerminalJob(job);
-			}
-		}
-		if (finalState == WorkerJobState::Stopped) {
-			emitEvent(WorkerEventType::Info, WorkerStatus::Ok, job->id, "job stopped");
-		} else if (finalState == WorkerJobState::Finished) {
-			emitEvent(WorkerEventType::Info, WorkerStatus::Ok, job->id, "job finished");
-		} else {
-			emitEvent(WorkerEventType::Error, WorkerStatus::InternalError, job->id, "job failed");
-		}
-	}
-
-	void markTaskExited(WorkerJobId jobId) {
-		WorkerLock lock(mutex);
-		if (!lock) {
-			return;
-		}
-		auto job = findJob(jobId);
-		if (job) {
-			job->taskExited = true;
-		}
-	}
-
-	bool waitWhileSleeping(const std::shared_ptr<WorkerJobRecord> &job, uint32_t durationMs) {
-		if (!job || durationMs == 0) {
+	bool waitWhileSleeping(WorkerJobRecord *job, uint32_t durationMs) {
+		if (job == nullptr || durationMs == 0) {
 			return true;
 		}
 		return waitForDuration(job, durationMs);
 	}
 
-	bool waitForDuration(const std::shared_ptr<WorkerJobRecord> &job, uint32_t durationMs) {
-		if (!job) {
+	bool waitForDuration(WorkerJobRecord *job, uint32_t durationMs) {
+		if (job == nullptr) {
 			return false;
 		}
 		const uint32_t startMs = nowMs();
@@ -388,7 +338,7 @@ struct WorkerImpl {
 						}
 					}
 					remainingMs = std::max(remainingMs, externalRemainingMs);
-					if (!isTerminalState(job->state)) {
+					if (!isExecutionCompleteState(job->state)) {
 						job->state = WorkerJobState::Sleeping;
 					}
 				}
@@ -397,33 +347,122 @@ struct WorkerImpl {
 			if (remainingMs == 0) {
 				break;
 			}
-
 			ulTaskNotifyTake(pdTRUE, waitTicks(remainingMs));
 		}
 		return !job->stopRequested.load();
 	}
 
-	void requestSleep(const std::shared_ptr<WorkerJobRecord> &job, uint32_t durationMs) {
-		if (!job || durationMs == 0) {
-			return;
-		}
-		TaskHandle_t handle = nullptr;
+	WorkerJobState executeJob(WorkerJobRecord *job) {
+		WorkerCallback callback;
 		{
 			WorkerLock lock(mutex);
-			if (!lock || isTerminalState(job->state)) {
+			if (!lock || job == nullptr) {
+				return WorkerJobState::Failed;
+			}
+			callback = std::move(job->callback);
+			job->callback = {};
+		}
+		if (!callback) {
+			return WorkerJobState::Failed;
+		}
+
+		WorkerJobContext context(job);
+		WorkerJobState finalState = WorkerJobState::Finished;
+		if (job->recurring) {
+			while (!job->stopRequested.load()) {
+				markRunStart(job);
+				callback(context);
+				if (job->stopRequested.load()) {
+					break;
+				}
+				waitForDuration(job, job->intervalMs);
+			}
+			finalState = WorkerJobState::Stopped;
+		} else {
+			markRunStart(job);
+			callback(context);
+			finalState =
+			    job->stopRequested.load() ? WorkerJobState::Stopped : WorkerJobState::Finished;
+		}
+		return finalState;
+	}
+
+	void prepareCleanup(
+	    WorkerJobRecord *job,
+	    WorkerJobState finalState,
+	    TaskHandle_t taskHandle
+	) {
+		WorkerLock lock(mutex);
+		if (!lock || job == nullptr) {
+			return;
+		}
+		job->stackHighWaterMarkBytes = worker_task_support::currentStackHighWaterMarkBytes();
+		job->finalState = finalState;
+		job->state = WorkerJobState::CallbackComplete;
+		job->finishedAtMs = nowMs();
+		job->taskHandle = taskHandle;
+	}
+
+	void queueCleanup(WorkerJobRecord *job, TaskHandle_t taskHandle) {
+		if (job == nullptr || cleanupQueue == nullptr) {
+			return;
+		}
+		{
+			WorkerLock lock(mutex);
+			if (lock) {
+				job->state = WorkerJobState::CleanupQueued;
+			}
+		}
+
+		const WorkerCleanupRequest request{
+		    job->id,
+		    taskHandle,
+		    job,
+		    job->allocation == WorkerTaskAllocation::WithCaps,
+		    false,
+		};
+		while (xQueueSend(cleanupQueue, &request, portMAX_DELAY) != pdPASS) {
+			vTaskDelay(1);
+		}
+
+		const uint32_t queueDepth = static_cast<uint32_t>(uxQueueMessagesWaiting(cleanupQueue));
+		WorkerLock lock(mutex);
+		if (lock) {
+			cleanupQueueHighWaterMark = std::max(cleanupQueueHighWaterMark, queueDepth);
+		}
+	}
+
+	void completeCleanup(const WorkerCleanupRequest &request) {
+		WorkerJobState finalState = WorkerJobState::Failed;
+		bool found = false;
+		{
+			WorkerLock lock(mutex);
+			if (!lock) {
 				return;
 			}
-			const uint32_t existingRemainingMs = job->hasSleepDeadline
-			    ? remainingSince(job->sleepStartMs, job->sleepDurationMs)
-			    : 0;
-			job->sleepStartMs = nowMs();
-			job->sleepDurationMs = std::max(existingRemainingMs, durationMs);
-			job->hasSleepDeadline = true;
-			job->state = WorkerJobState::Sleeping;
-			handle = job->taskHandle;
+			WorkerJobRecord *job = findJob(request.jobId);
+			if (job == request.record && job != nullptr) {
+				job->state = WorkerJobState::CleanupComplete;
+				finalState = job->finalState;
+				recordCompletion(job->id, finalState);
+				eraseJob(job->id);
+				found = true;
+			}
 		}
-		if (handle != nullptr) {
-			xTaskNotifyGive(handle);
+		if (!found) {
+			return;
+		}
+		if (finalState == WorkerJobState::Stopped) {
+			emitEvent(WorkerEventType::Info, WorkerStatus::Ok, request.jobId, "job stopped");
+		} else if (finalState == WorkerJobState::Finished) {
+			emitEvent(WorkerEventType::Info, WorkerStatus::Ok, request.jobId, "job finished");
+		} else {
+			emitEvent(
+			    WorkerEventType::Error,
+			    WorkerStatus::InternalError,
+			    request.jobId,
+			    "job failed"
+			);
 		}
 	}
 
@@ -471,7 +510,7 @@ struct WorkerImpl {
 			actualStackType = WorkerStackType::Psram;
 		}
 
-		std::shared_ptr<WorkerJobRecord> job(new (std::nothrow) WorkerJobRecord());
+		std::unique_ptr<WorkerJobRecord> job(new (std::nothrow) WorkerJobRecord());
 		if (!job) {
 			return emitJobResult(WorkerJobResult::failure(
 			    WorkerStatus::OutOfMemory,
@@ -480,7 +519,7 @@ struct WorkerImpl {
 		}
 
 		job->owner = this;
-		job->callback = callback;
+		job->callback = std::move(callback);
 		job->recurring = recurring;
 		job->intervalMs = intervalMs;
 		job->stackSize = jobConfig.stackSize;
@@ -488,127 +527,226 @@ struct WorkerImpl {
 		job->coreId = jobConfig.coreId;
 		job->requestedStackType = jobConfig.stackType;
 		job->actualStackType = actualStackType;
+		job->allocation = usePsramStack
+		    ? WorkerTaskAllocation::WithCaps
+		    : WorkerTaskAllocation::Internal;
 		if (jobConfig.name != nullptr && *jobConfig.name != '\0') {
 			copyTaskName(job->name, sizeof(job->name), jobConfig.name);
 		}
 
-		auto taskArg = new (std::nothrow) std::shared_ptr<WorkerJobRecord>(job);
-		if (taskArg == nullptr) {
-			return emitJobResult(WorkerJobResult::failure(
-			    WorkerStatus::OutOfMemory,
-			    "failed to allocate task argument"
-			));
-		}
-
-		TaskHandle_t handle = nullptr;
-		bool createdWithCaps = false;
-
+		WorkerJobResult result;
 		{
 			WorkerLock lock(mutex);
 			if (!lock) {
-				delete taskArg;
 				return emitJobResult(WorkerJobResult::failure(
 				    WorkerStatus::InternalError,
 				    "failed to lock worker registry"
 				));
 			}
-			if (!initialized) {
-				delete taskArg;
+			if (!initialized || cleanupQueue == nullptr || cleanupTaskHandle == nullptr) {
 				return emitJobResult(WorkerJobResult::failure(
 				    WorkerStatus::NotInitialized,
 				    "worker is not initialized"
 				));
 			}
 			if (ending) {
-				delete taskArg;
 				return emitJobResult(WorkerJobResult::failure(
 				    WorkerStatus::Busy,
 				    "worker is ending"
 				));
 			}
-
-			job->id = nextJobId++;
-			accountCreatedJob(job);
-			jobs.push_back(job);
-
-			const BaseType_t created = worker_task_support::createTask(
-			    &WorkerImpl::taskEntry,
-			    job->name,
-			    job->stackSize,
-			    taskArg,
-			    job->priority,
-			    &handle,
-			    job->coreId,
-			    usePsramStack,
-			    createdWithCaps
-			);
-			if (created != pdPASS || handle == nullptr) {
-				delete taskArg;
-				markFailed(job);
+			if (jobs.size() >= config.maxConcurrentJobs) {
 				return emitJobResult(WorkerJobResult::failure(
-				    WorkerStatus::TaskCreateFailed,
-				    "failed to create job task",
-				    job->id
+				    WorkerStatus::Busy,
+				    "maximum concurrent jobs reached"
 				));
 			}
-			job->taskHandle = handle;
-			job->createdWithCaps = createdWithCaps;
-		}
 
-		return WorkerJobResult::success(job->id, "job started");
+			job->id = allocateJobId();
+			WorkerJobRecord *jobRecord = job.get();
+			const WorkerJobId jobId = job->id;
+			jobs.push_back(std::move(job));
+
+			TaskHandle_t handle = nullptr;
+			const BaseType_t created = worker_task_support::createTask(
+			    &WorkerImpl::taskEntry,
+			    jobRecord->name,
+			    jobRecord->stackSize,
+			    jobRecord,
+			    jobRecord->priority,
+			    &handle,
+			    jobRecord->coreId,
+			    usePsramStack
+			);
+			if (created != pdPASS || handle == nullptr) {
+				eraseJob(jobId);
+				result = WorkerJobResult::failure(
+				    WorkerStatus::TaskCreateFailed,
+				    "failed to create job task",
+				    jobId
+				);
+			} else {
+				jobRecord->taskHandle = handle;
+				result = WorkerJobResult::success(jobId, "job started");
+			}
+		}
+		return emitJobResult(result);
 	}
 
-	static TaskEntryExit runTaskEntry(void *arg) {
-		TaskEntryExit exit;
-		std::unique_ptr<std::shared_ptr<WorkerJobRecord>> holder(
-		    static_cast<std::shared_ptr<WorkerJobRecord> *>(arg)
+	bool initializeCleanupInfrastructure(const WorkerConfig &incomingConfig) {
+		cleanupQueue = xQueueCreate(
+		    static_cast<UBaseType_t>(incomingConfig.maxConcurrentJobs),
+		    sizeof(WorkerCleanupRequest)
 		);
-		if (!holder || !(*holder)) {
-			// Defensive only: stack allocation caps are unknowable without a valid task arg.
-			return exit;
+		if (cleanupQueue == nullptr) {
+			return false;
 		}
-
-		auto job = *holder;
-		exit.createdWithCaps = job->createdWithCaps;
-
-		WorkerImpl *owner = job->owner;
-		if (owner == nullptr) {
-			return exit;
+		cleanupTaskReadyForDelete.store(false);
+		cleanupTaskStopRequested = false;
+		cleanupTaskRunning = false;
+		cleanupQueueHighWaterMark = 0;
+		cleanupTaskHandle = nullptr;
+		const BaseType_t created = worker_task_support::createInternalTask(
+		    &WorkerImpl::cleanupTaskEntry,
+		    kCleanupTaskName,
+		    incomingConfig.cleanupTaskStackSize,
+		    this,
+		    incomingConfig.cleanupTaskPriority,
+		    &cleanupTaskHandle,
+		    incomingConfig.cleanupTaskCoreId
+		);
+		if (created != pdPASS || cleanupTaskHandle == nullptr) {
+			vQueueDelete(cleanupQueue);
+			cleanupQueue = nullptr;
+			cleanupTaskHandle = nullptr;
+			return false;
 		}
+		return true;
+	}
 
-		exit.owner = owner;
-		exit.jobId = job->id;
-
-		WorkerJobContext context(job);
-		WorkerJobState finalState = WorkerJobState::Finished;
-
-		if (job->recurring) {
-			while (!job->stopRequested.load()) {
-				owner->markRunStart(job);
-				job->callback(context);
-				if (job->stopRequested.load()) {
-					break;
-				}
-				owner->waitForDuration(job, job->intervalMs);
+	WorkerResult stopCleanupInfrastructure(uint32_t startMs, uint32_t timeoutMs) {
+		QueueHandle_t queue = nullptr;
+		TaskHandle_t handle = nullptr;
+		bool sendStop = false;
+		{
+			WorkerLock lock(mutex);
+			if (!lock) {
+				return WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 			}
-			finalState = WorkerJobState::Stopped;
-		} else {
-			owner->markRunStart(job);
-			job->callback(context);
-			finalState =
-			    job->stopRequested.load() ? WorkerJobState::Stopped : WorkerJobState::Finished;
+			queue = cleanupQueue;
+			handle = cleanupTaskHandle;
+			if (queue == nullptr || handle == nullptr) {
+				return WorkerResult::success("cleanup task already stopped");
+			}
+			if (!cleanupTaskStopRequested) {
+				cleanupTaskStopRequested = true;
+				sendStop = true;
+			}
 		}
 
-		owner->markTaskFinished(job, finalState);
-		return exit;
+		if (sendStop) {
+			const WorkerCleanupRequest stopRequest{
+			    kInvalidJobId,
+			    nullptr,
+			    nullptr,
+			    false,
+			    true,
+			};
+			if (xQueueSend(queue, &stopRequest, 0) != pdPASS) {
+				WorkerLock lock(mutex);
+				if (lock) {
+					cleanupTaskStopRequested = false;
+				}
+				return WorkerResult::failure(
+				    WorkerStatus::InternalError,
+				    "failed to stop cleanup task"
+				);
+			}
+		}
+
+		while (!cleanupTaskReadyForDelete.load()) {
+			if (elapsedSince(startMs, timeoutMs)) {
+				return WorkerResult::failure(WorkerStatus::Timeout, "worker end timed out");
+			}
+			vTaskDelay(pdMS_TO_TICKS(kWaitPollMs));
+		}
+
+		worker_task_support::deleteTask(handle, false);
+		{
+			WorkerLock lock(mutex);
+			if (lock) {
+				cleanupTaskHandle = nullptr;
+				cleanupTaskRunning = false;
+				cleanupTaskStopRequested = false;
+				cleanupTaskReadyForDelete.store(false);
+				cleanupQueue = nullptr;
+			}
+		}
+		vQueueDelete(queue);
+		return WorkerResult::success("cleanup task stopped");
 	}
 
 	static void taskEntry(void *arg) {
-		const TaskEntryExit exit = runTaskEntry(arg);
-		if (exit.owner != nullptr && exit.jobId != kInvalidJobId) {
-			exit.owner->markTaskExited(exit.jobId);
+		auto *job = static_cast<WorkerJobRecord *>(arg);
+		if (job == nullptr || job->owner == nullptr) {
+			vTaskDelete(nullptr);
+			return;
 		}
-		worker_task_support::deleteCurrentTask(exit.createdWithCaps);
+
+		WorkerImpl *owner = job->owner;
+		const TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
+		const WorkerJobState finalState = owner->executeJob(job);
+		owner->prepareCleanup(job, finalState, currentTask);
+		owner->queueCleanup(job, currentTask);
+
+		job->readyForDelete.store(true, std::memory_order_release);
+		vTaskSuspend(nullptr);
+		for (;;) {
+			vTaskDelay(portMAX_DELAY);
+		}
+	}
+
+	static void cleanupTaskEntry(void *arg) {
+		auto *owner = static_cast<WorkerImpl *>(arg);
+		if (owner == nullptr) {
+			vTaskDelete(nullptr);
+			return;
+		}
+		{
+			WorkerLock lock(owner->mutex);
+			if (lock) {
+				owner->cleanupTaskRunning = true;
+			}
+		}
+
+		for (;;) {
+			WorkerCleanupRequest request;
+			if (xQueueReceive(owner->cleanupQueue, &request, portMAX_DELAY) != pdPASS) {
+				continue;
+			}
+			if (request.stopCleanupTask) {
+				{
+					WorkerLock lock(owner->mutex);
+					if (lock) {
+						owner->cleanupTaskRunning = false;
+					}
+				}
+				owner->cleanupTaskReadyForDelete.store(true, std::memory_order_release);
+				vTaskSuspend(nullptr);
+				for (;;) {
+					vTaskDelay(portMAX_DELAY);
+				}
+			}
+
+			if (request.record == nullptr || request.taskHandle == nullptr) {
+				continue;
+			}
+			while (!request.record->readyForDelete.load(std::memory_order_acquire)) {
+				taskYIELD();
+			}
+			worker_task_support::deleteTask(request.taskHandle, request.withCaps);
+			owner->completeCleanup(request);
+		}
 	}
 };
 
@@ -650,21 +788,21 @@ WorkerJobResult WorkerJobResult::failure(
 	return result;
 }
 
-WorkerJobContext::WorkerJobContext(std::shared_ptr<WorkerJobRecord> record) : _record(record) {
+WorkerJobContext::WorkerJobContext(WorkerJobRecord *record) : _record(record) {
 }
 
 WorkerJobId WorkerJobContext::id() const {
-	return _record ? _record->id : kInvalidJobId;
+	return _record != nullptr ? _record->id : kInvalidJobId;
 }
 
 void WorkerJobContext::stop() {
-	if (_record) {
+	if (_record != nullptr) {
 		_record->stopRequested.store(true);
 	}
 }
 
 void WorkerJobContext::sleep(uint32_t durationMs) {
-	if (!_record || _record->owner == nullptr) {
+	if (_record == nullptr || _record->owner == nullptr) {
 		return;
 	}
 	_record->owner->waitWhileSleeping(_record, durationMs);
@@ -675,7 +813,7 @@ bool WorkerJobContext::shouldStop() const {
 }
 
 uint32_t WorkerJobContext::runCount() const {
-	if (!_record || _record->owner == nullptr) {
+	if (_record == nullptr || _record->owner == nullptr) {
 		return 0;
 	}
 	WorkerLock lock(_record->owner->mutex);
@@ -683,7 +821,7 @@ uint32_t WorkerJobContext::runCount() const {
 }
 
 uint64_t WorkerJobContext::startedAtMs() const {
-	if (!_record || _record->owner == nullptr) {
+	if (_record == nullptr || _record->owner == nullptr) {
 		return 0;
 	}
 	WorkerLock lock(_record->owner->mutex);
@@ -691,7 +829,7 @@ uint64_t WorkerJobContext::startedAtMs() const {
 }
 
 uint64_t WorkerJobContext::lastRunAtMs() const {
-	if (!_record || _record->owner == nullptr) {
+	if (_record == nullptr || _record->owner == nullptr) {
 		return 0;
 	}
 	WorkerLock lock(_record->owner->mutex);
@@ -711,6 +849,20 @@ WorkerResult Worker::init(const WorkerConfig &config) {
 	if (!_impl) {
 		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
+	if (!worker_task_support::isValidStackSize(config.defaultStackSize) ||
+	    !worker_task_support::isValidStackSize(config.cleanupTaskStackSize)) {
+		return _impl->emitResult(WorkerResult::failure(
+		    WorkerStatus::InvalidArgument,
+		    "task stack sizes must be at least 1024 bytes and aligned"
+		));
+	}
+	if (config.maxConcurrentJobs == 0) {
+		return _impl->emitResult(WorkerResult::failure(
+		    WorkerStatus::InvalidArgument,
+		    "maximum concurrent jobs must be greater than zero"
+		));
+	}
+
 	WorkerResult failure;
 	bool hasFailure = false;
 	{
@@ -719,22 +871,26 @@ WorkerResult Worker::init(const WorkerConfig &config) {
 			return WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 		}
 		if (_impl->initialized) {
-			failure =
-			    WorkerResult::failure(WorkerStatus::AlreadyInitialized, "worker already initialized");
-			hasFailure = true;
-		} else if (!worker_task_support::isValidStackSize(config.defaultStackSize)) {
 			failure = WorkerResult::failure(
-			    WorkerStatus::InvalidArgument,
-			    "default stack size must be at least 1024 bytes and aligned"
+			    WorkerStatus::AlreadyInitialized,
+			    "worker already initialized"
 			);
 			hasFailure = true;
 		} else {
 			_impl->config = config;
-			_impl->initialized = true;
 			_impl->ending = false;
 			_impl->nextJobId = 1;
 			_impl->jobs.clear();
-			_impl->resetDiagnostics();
+			_impl->completions.clear();
+			if (!_impl->initializeCleanupInfrastructure(config)) {
+				failure = WorkerResult::failure(
+				    WorkerStatus::TaskCreateFailed,
+				    "failed to initialize cleanup task"
+				);
+				hasFailure = true;
+			} else {
+				_impl->initialized = true;
+			}
 		}
 	}
 	if (hasFailure) {
@@ -750,7 +906,7 @@ void Worker::onEvent(WorkerEventCallback callback) {
 	}
 	WorkerLock lock(_impl->mutex);
 	if (lock) {
-		_impl->onEvent = callback;
+		_impl->onEvent = std::move(callback);
 	}
 }
 
@@ -758,21 +914,26 @@ WorkerJobResult Worker::once(WorkerCallback callback) {
 	if (!_impl) {
 		return WorkerJobResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
-	return _impl->startJob(_impl->defaultJobConfig(), callback, false, 0);
+	return _impl->startJob(_impl->defaultJobConfig(), std::move(callback), false, 0);
 }
 
 WorkerJobResult Worker::once(const WorkerJobConfig &config, WorkerCallback callback) {
 	if (!_impl) {
 		return WorkerJobResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
-	return _impl->startJob(config, callback, false, 0);
+	return _impl->startJob(config, std::move(callback), false, 0);
 }
 
 WorkerJobResult Worker::every(uint32_t intervalMs, WorkerCallback callback) {
 	if (!_impl) {
 		return WorkerJobResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
-	return _impl->startJob(_impl->defaultJobConfig(), callback, true, intervalMs);
+	return _impl->startJob(
+	    _impl->defaultJobConfig(),
+	    std::move(callback),
+	    true,
+	    intervalMs
+	);
 }
 
 WorkerJobResult Worker::every(
@@ -783,7 +944,7 @@ WorkerJobResult Worker::every(
 	if (!_impl) {
 		return WorkerJobResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
-	return _impl->startJob(config, callback, true, intervalMs);
+	return _impl->startJob(config, std::move(callback), true, intervalMs);
 }
 
 WorkerResult Worker::stop(WorkerJobId jobId) {
@@ -800,11 +961,15 @@ WorkerResult Worker::stop(WorkerJobId jobId) {
 			failure = WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 			hasFailure = true;
 		} else {
-			auto job = _impl->findJob(jobId);
-			if (!job) {
-				failure = WorkerResult::failure(WorkerStatus::JobNotFound, "job not found");
-				hasFailure = true;
-			} else if (isTerminalState(job->state)) {
+			WorkerJobRecord *job = _impl->findJob(jobId);
+			if (job == nullptr) {
+				if (_impl->hasCompletion(jobId)) {
+					alreadyFinished = true;
+				} else {
+					failure = WorkerResult::failure(WorkerStatus::JobNotFound, "job not found");
+					hasFailure = true;
+				}
+			} else if (isExecutionCompleteState(job->state)) {
 				alreadyFinished = true;
 			} else {
 				job->stopRequested.store(true);
@@ -830,7 +995,6 @@ WorkerResult Worker::stopAndWait(WorkerJobId jobId, uint32_t timeoutMs) {
 		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
 	TaskHandle_t handle = nullptr;
-	std::shared_ptr<WorkerJobRecord> job;
 	WorkerResult failure;
 	bool hasFailure = false;
 	{
@@ -839,11 +1003,13 @@ WorkerResult Worker::stopAndWait(WorkerJobId jobId, uint32_t timeoutMs) {
 			failure = WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 			hasFailure = true;
 		} else {
-			job = _impl->findJob(jobId);
-			if (!job) {
-				failure = WorkerResult::failure(WorkerStatus::JobNotFound, "job not found");
-				hasFailure = true;
-			} else if (!isTerminalState(job->state)) {
+			WorkerJobRecord *job = _impl->findJob(jobId);
+			if (job == nullptr) {
+				if (!_impl->hasCompletion(jobId)) {
+					failure = WorkerResult::failure(WorkerStatus::JobNotFound, "job not found");
+					hasFailure = true;
+				}
+			} else if (!isExecutionCompleteState(job->state)) {
 				job->stopRequested.store(true);
 				job->state = WorkerJobState::Stopping;
 				handle = job->taskHandle;
@@ -856,7 +1022,7 @@ WorkerResult Worker::stopAndWait(WorkerJobId jobId, uint32_t timeoutMs) {
 	if (handle != nullptr) {
 		xTaskNotifyGive(handle);
 	}
-	return _impl->waitForJob(job, jobId, timeoutMs);
+	return _impl->waitForJobId(jobId, timeoutMs);
 }
 
 WorkerResult Worker::sleep(WorkerJobId jobId, uint32_t durationMs) {
@@ -869,7 +1035,8 @@ WorkerResult Worker::sleep(WorkerJobId jobId, uint32_t durationMs) {
 		    jobId
 		);
 	}
-	std::shared_ptr<WorkerJobRecord> job;
+
+	TaskHandle_t handle = nullptr;
 	WorkerResult failure;
 	bool hasFailure = false;
 	{
@@ -878,20 +1045,33 @@ WorkerResult Worker::sleep(WorkerJobId jobId, uint32_t durationMs) {
 			failure = WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 			hasFailure = true;
 		} else {
-			job = _impl->findJob(jobId);
-			if (!job) {
-				failure = WorkerResult::failure(WorkerStatus::JobNotFound, "job not found");
+			WorkerJobRecord *job = _impl->findJob(jobId);
+			if (job == nullptr) {
+				failure = _impl->hasCompletion(jobId)
+				    ? WorkerResult::failure(WorkerStatus::InvalidArgument, "job already finished")
+				    : WorkerResult::failure(WorkerStatus::JobNotFound, "job not found");
 				hasFailure = true;
-			} else if (isTerminalState(job->state)) {
+			} else if (isExecutionCompleteState(job->state)) {
 				failure = WorkerResult::failure(WorkerStatus::InvalidArgument, "job already finished");
 				hasFailure = true;
+			} else {
+				const uint32_t existingRemainingMs = job->hasSleepDeadline
+				    ? remainingSince(job->sleepStartMs, job->sleepDurationMs)
+				    : 0;
+				job->sleepStartMs = nowMs();
+				job->sleepDurationMs = std::max(existingRemainingMs, durationMs);
+				job->hasSleepDeadline = true;
+				job->state = WorkerJobState::Sleeping;
+				handle = job->taskHandle;
 			}
 		}
 	}
 	if (hasFailure) {
 		return _impl->emitResult(failure, jobId);
 	}
-	_impl->requestSleep(job, durationMs);
+	if (handle != nullptr) {
+		xTaskNotifyGive(handle);
+	}
 	return WorkerResult::success("job sleep requested");
 }
 
@@ -903,36 +1083,14 @@ WorkerResult Worker::waitFor(WorkerJobId jobId, uint32_t timeoutMs) {
 	if (!_impl) {
 		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
-	std::shared_ptr<WorkerJobRecord> job;
-	{
-		WorkerLock lock(_impl->mutex);
-		if (!lock) {
-			return _impl->emitResult(
-			    WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker"),
-			    jobId
-			);
-		}
-		job = _impl->findJob(jobId);
-		if (!job) {
-			return _impl->emitResult(
-			    WorkerResult::failure(WorkerStatus::JobNotFound, "job not found"),
-			    jobId
-			);
-		}
-	}
-	return _impl->waitForJob(job, jobId, timeoutMs);
+	return _impl->waitForJobId(jobId, timeoutMs);
 }
 
 WorkerResult Worker::clearFinished() {
 	if (!_impl) {
 		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
-	WorkerLock lock(_impl->mutex);
-	if (!lock) {
-		return WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
-	}
-	_impl->reapTerminalJobs();
-	return WorkerResult::success("finished jobs cleared");
+	return WorkerResult::success("completed jobs are cleaned automatically");
 }
 
 WorkerDiag Worker::getDiagnostics() {
@@ -944,13 +1102,14 @@ WorkerDiag Worker::getDiagnostics() {
 	if (!lock) {
 		return diag;
 	}
-	diag.totalJobCount = _impl->totalJobCount;
-	diag.finishedJobCount = _impl->finishedJobCount;
-	diag.stoppedJobCount = _impl->stoppedJobCount;
-	diag.failedJobCount = _impl->failedJobCount;
-	diag.psramStackJobCount = _impl->psramStackJobCount;
-	diag.internalStackJobCount = _impl->internalStackJobCount;
-	diag.totalStackHighWaterMarkBytes = _impl->terminalStackHighWaterMarkBytes;
+
+	diag.activeJobCount = static_cast<uint32_t>(_impl->jobs.size());
+	diag.cleanupTaskRunning = _impl->cleanupTaskRunning;
+	diag.cleanupQueueHighWaterMark = _impl->cleanupQueueHighWaterMark;
+	if (_impl->cleanupQueue != nullptr) {
+		diag.cleanupQueueDepth =
+		    static_cast<uint32_t>(uxQueueMessagesWaiting(_impl->cleanupQueue));
+	}
 	for (const auto &job : _impl->jobs) {
 		if (!job) {
 			continue;
@@ -962,8 +1121,15 @@ WorkerDiag Worker::getDiagnostics() {
 		case WorkerJobState::Sleeping:
 			diag.sleepingJobCount++;
 			break;
-		case WorkerJobState::Created:
 		case WorkerJobState::Stopping:
+			diag.stoppingJobCount++;
+			break;
+		case WorkerJobState::CallbackComplete:
+		case WorkerJobState::CleanupQueued:
+			diag.cleanupQueuedCount++;
+			break;
+		case WorkerJobState::Created:
+		case WorkerJobState::CleanupComplete:
 		case WorkerJobState::Stopped:
 		case WorkerJobState::Finished:
 		case WorkerJobState::Failed:
@@ -985,8 +1151,8 @@ WorkerResult Worker::getJobDiagnostics(WorkerJobId jobId, WorkerJobDiag &out) {
 			failure = WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 			hasFailure = true;
 		} else {
-			auto job = _impl->findJob(jobId);
-			if (!job) {
+			WorkerJobRecord *job = _impl->findJob(jobId);
+			if (job == nullptr) {
 				failure = WorkerResult::failure(WorkerStatus::JobNotFound, "job not found");
 				hasFailure = true;
 			} else {
@@ -1016,6 +1182,8 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 	if (!_impl) {
 		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
+
+	const uint32_t startMs = nowMs();
 	std::vector<TaskHandle_t> handles;
 	{
 		WorkerLock lock(_impl->mutex);
@@ -1027,7 +1195,7 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 		}
 		_impl->ending = true;
 		for (auto &job : _impl->jobs) {
-			if (!job || isTerminalState(job->state)) {
+			if (!job || isExecutionCompleteState(job->state)) {
 				continue;
 			}
 			job->stopRequested.store(true);
@@ -1041,22 +1209,16 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 		xTaskNotifyGive(handle);
 	}
 
-	const uint32_t startMs = nowMs();
 	while (true) {
-		bool allFinished = true;
+		bool jobsEmpty = false;
 		{
 			WorkerLock lock(_impl->mutex);
 			if (!lock) {
 				return WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 			}
-			for (auto &job : _impl->jobs) {
-				if (job && !isReapableJob(job)) {
-					allFinished = false;
-					break;
-				}
-			}
+			jobsEmpty = _impl->jobs.empty();
 		}
-		if (allFinished) {
+		if (jobsEmpty) {
 			break;
 		}
 		if (elapsedSince(startMs, timeoutMs)) {
@@ -1067,14 +1229,20 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 		vTaskDelay(pdMS_TO_TICKS(kWaitPollMs));
 	}
 
+	WorkerResult cleanupResult = _impl->stopCleanupInfrastructure(startMs, timeoutMs);
+	if (!cleanupResult) {
+		return _impl->emitResult(cleanupResult);
+	}
+
 	{
 		WorkerLock lock(_impl->mutex);
 		if (lock) {
 			_impl->jobs.clear();
+			_impl->completions.clear();
 			_impl->nextJobId = 1;
 			_impl->initialized = false;
 			_impl->ending = false;
-			_impl->resetDiagnostics();
+			_impl->cleanupQueueHighWaterMark = 0;
 		}
 	}
 	_impl->emitEvent(WorkerEventType::Info, WorkerStatus::Ok, kInvalidJobId, "worker ended");
@@ -1135,6 +1303,12 @@ const char *Worker::jobStateToString(WorkerJobState state) const {
 		return "finished";
 	case WorkerJobState::Failed:
 		return "failed";
+	case WorkerJobState::CallbackComplete:
+		return "callbackComplete";
+	case WorkerJobState::CleanupQueued:
+		return "cleanupQueued";
+	case WorkerJobState::CleanupComplete:
+		return "cleanupComplete";
 	}
 	return "unknown";
 }
