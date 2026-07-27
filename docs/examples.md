@@ -2,28 +2,28 @@
 
 ## Basic
 
-Shows initialization, a one-off job, a recurring job, `waitFor()`, and cooperative stop from inside the callback.
+Shows initialization, a fire-and-forget one-off job, a recurring job, optional waiting, and cooperative stop.
 
 ## JobConfig
 
-Shows `WorkerJobConfig` with explicit stack size, priority, core affinity, task name, and stack memory preference.
+Shows stack size, priority, core affinity, internal stack selection, and PSRAM stack requests.
 
 ## Events
 
-Shows `onEvent()` and how to check `event.isError()` or `event.type`.
+Shows synchronous Worker event reporting. Job completion events are emitted after physical task cleanup.
 
 ## SleepAndWait
 
-Shows `ctx.sleep()`, external `worker.sleep(jobId, durationMs)`, `waitFor()`, and `stopAndWait()`.
+Shows `ctx.sleep()`, external `worker.sleep(jobId, durationMs)`, optional `waitFor()`, and timeout behavior.
 
 ## Diagnostics
 
-Shows aggregate `getDiagnostics()` counters and `getJobDiagnostics()` for a job. Completed jobs remain available for diagnostics until `waitFor()` can consume them after task cleanup, `clearFinished()` is called, or Worker ends.
+Shows current active-job counts, cleanup queue state, cleanup-task health, and active per-job diagnostics.
 
 ## BindableCallbacks
 
-Shows `std::bind` with private class methods, so application classes can own job behavior.
+Shows `std::bind` with private class methods so application classes can own job behavior.
 
 ## TaskCleanupSentinel
 
-Shows a runtime sentinel for verifying callback captures and task-entry RAII objects are cleaned up before `waitFor()` returns.
+Runs fire-and-forget one-shot jobs and verifies callback capture destruction, active record cleanup, internal heap stability, PSRAM stability, and task-count recovery after allocator warm-up.
