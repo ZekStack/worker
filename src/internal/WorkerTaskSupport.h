@@ -62,10 +62,8 @@ inline BaseType_t createTask(
     UBaseType_t priority,
     TaskHandle_t *handle,
     BaseType_t coreId,
-    bool usePsramStack,
-    bool &createdWithCaps
+    bool usePsramStack
 ) {
-	createdWithCaps = false;
 	if (!isValidStackSize(stackBytes)) {
 		return pdFAIL;
 	}
@@ -74,7 +72,7 @@ inline BaseType_t createTask(
 		if (!hasExternalStackSupport()) {
 			return pdFAIL;
 		}
-		const BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+		return xTaskCreatePinnedToCoreWithCaps(
 		    entry,
 		    name,
 		    static_cast<configSTACK_DEPTH_TYPE>(stackBytes),
@@ -84,8 +82,6 @@ inline BaseType_t createTask(
 		    coreId,
 		    kExternalStackCaps
 		);
-		createdWithCaps = created == pdPASS;
-		return created;
 #else
 		return pdFAIL;
 #endif
@@ -111,13 +107,34 @@ inline BaseType_t createTask(
 	);
 }
 
-inline void deleteCurrentTask(bool withCaps) {
+inline BaseType_t createInternalTask(
+    TaskFunction_t entry,
+    const char *name,
+    size_t stackBytes,
+    void *arg,
+    UBaseType_t priority,
+    TaskHandle_t *handle,
+    BaseType_t coreId
+) {
+	return createTask(entry, name, stackBytes, arg, priority, handle, coreId, false);
+}
+
+inline void deleteTask(TaskHandle_t handle, bool withCaps) {
+	if (handle == nullptr) {
+		return;
+	}
 #if WORKER_CAN_USE_EXTERNAL_STACKS
 	if (withCaps) {
-		vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
+		vTaskDeleteWithCaps(handle);
 		return;
 	}
 #endif
-	vTaskDelete(nullptr);
+	vTaskSuspend(handle);
+#if defined(INCLUDE_eTaskGetState) && (INCLUDE_eTaskGetState == 1)
+	while (eTaskGetState(handle) == eRunning) {
+		taskYIELD();
+	}
+#endif
+	vTaskDelete(handle);
 }
 } // namespace worker_task_support

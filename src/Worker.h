@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -51,6 +53,9 @@ enum class WorkerJobState : uint8_t {
 	Stopped,
 	Finished,
 	Failed,
+	CallbackComplete,
+	CleanupQueued,
+	CleanupComplete,
 };
 
 struct WorkerEvent {
@@ -69,6 +74,11 @@ struct WorkerConfig {
 	UBaseType_t defaultPriority = 1;
 	BaseType_t defaultCoreId = tskNO_AFFINITY;
 	WorkerStackType defaultStackType = WorkerStackType::Auto;
+
+	size_t maxConcurrentJobs = 8;
+	uint32_t cleanupTaskStackSize = 3072;
+	UBaseType_t cleanupTaskPriority = 1;
+	BaseType_t cleanupTaskCoreId = tskNO_AFFINITY;
 };
 
 struct WorkerJobConfig {
@@ -100,15 +110,14 @@ struct WorkerJobResult : WorkerResult {
 };
 
 struct WorkerDiag {
-	uint32_t totalJobCount = 0;
+	uint32_t activeJobCount = 0;
 	uint32_t runningJobCount = 0;
 	uint32_t sleepingJobCount = 0;
-	uint32_t finishedJobCount = 0;
-	uint32_t stoppedJobCount = 0;
-	uint32_t failedJobCount = 0;
-	uint32_t psramStackJobCount = 0;
-	uint32_t internalStackJobCount = 0;
-	size_t totalStackHighWaterMarkBytes = 0;
+	uint32_t stoppingJobCount = 0;
+	uint32_t cleanupQueuedCount = 0;
+	bool cleanupTaskRunning = false;
+	uint32_t cleanupQueueDepth = 0;
+	uint32_t cleanupQueueHighWaterMark = 0;
 };
 
 struct WorkerJobDiag {
@@ -143,9 +152,9 @@ class WorkerJobContext {
 	friend class Worker;
 	friend struct WorkerImpl;
 
-	explicit WorkerJobContext(std::shared_ptr<WorkerJobRecord> record);
+	explicit WorkerJobContext(WorkerJobRecord *record);
 
-	std::shared_ptr<WorkerJobRecord> _record;
+	WorkerJobRecord *_record = nullptr;
 };
 
 class Worker {
@@ -175,6 +184,8 @@ class Worker {
 	WorkerResult sleep(WorkerJobId jobId, uint32_t durationMs);
 	WorkerResult waitFor(WorkerJobId jobId);
 	WorkerResult waitFor(WorkerJobId jobId, uint32_t timeoutMs);
+
+	[[deprecated("Worker cleans completed jobs automatically")]]
 	WorkerResult clearFinished();
 
 	WorkerDiag getDiagnostics();

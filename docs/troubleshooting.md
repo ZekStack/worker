@@ -6,21 +6,32 @@ Check `WorkerJobResult::message` and `status`.
 
 Common causes:
 
-* Worker was not initialized.
-* The callback is empty.
-* Stack size is below 1024 bytes.
-* Stack size is not aligned to `sizeof(StackType_t)`.
-* `WorkerStackType::Psram` was requested on a board or framework build without PSRAM task stack support.
+- Worker was not initialized.
+- The callback is empty.
+- Stack size is below 1024 bytes or is not aligned.
+- `WorkerStackType::Psram` was requested without PSRAM task stack support.
+- `maxConcurrentJobs` was reached. Retry later or raise the configured bound.
+- Worker cleanup infrastructure could not be created during `init()`.
 
-## `stopAndWait()` times out
+## `stopAndWait()` or `end()` times out
 
-Worker uses cooperative cancellation. `stop()` sets a flag and wakes sleeping jobs, but a callback that blocks forever must return before the task can finish.
+Cancellation is cooperative. Worker wakes sleeping jobs, but a callback must return before its task can be cleaned. Check `ctx.shouldStop()` inside long-running callbacks.
 
-Check `ctx.shouldStop()` inside long-running callbacks.
+`waitFor()` and `stopAndWait()` wait for external task deletion, including stack and TCB release. They may take slightly longer than callback completion.
+
+## Active jobs never return to zero
+
+Inspect `cleanupQueuedCount`, `cleanupQueueDepth`, and `cleanupTaskRunning`.
+
+- A nonzero cleanup queue should drain automatically.
+- `cleanupTaskRunning` must remain true while Worker is initialized.
+- A callback that never returns prevents its job from reaching cleanup.
+
+Callers must not invoke `clearFinished()` for recovery. It is a deprecated no-op because cleanup is Worker-owned.
 
 ## `every()` runs slower than expected
 
-The interval delay starts after the callback returns. A callback that takes 200 ms with `every(1000, ...)` runs roughly every 1200 ms.
+The interval starts after the callback returns. A 200 ms callback with `every(1000, ...)` runs roughly every 1200 ms.
 
 ## Stack diagnostics are zero
 
