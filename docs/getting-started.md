@@ -19,13 +19,15 @@ void setup() {
 }
 ```
 
-Create a one-off job with `once()`.
+Create a fire-and-forget one-off job with `once()`.
 
 ```cpp
 worker.once([](WorkerJobContext &ctx) {
 	Serial.printf("job id=%u\n", static_cast<unsigned>(ctx.id()));
 });
 ```
+
+No cleanup call is required. Worker releases the callback, task stack, TCB, and job record automatically.
 
 Create a recurring job with `every()`.
 
@@ -39,3 +41,5 @@ worker.every(1000, [](WorkerJobContext &ctx) {
 ```
 
 `every()` delays internally after the callback returns. Do not add a delay only to protect the system from spinning.
+
+Use `waitFor()` only when application logic needs synchronization with physical task cleanup.
