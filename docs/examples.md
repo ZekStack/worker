@@ -1,29 +1,15 @@
 # Examples
 
-## Basic
+Worker examples are compiled in CI with both PIOArduino and Arduino CLI across ESP32, ESP32-S3, ESP32-C3, and ESP32-P4. CI installs the pinned Strata `v0.1.1` dependency before building them.
 
-Shows initialization, a fire-and-forget one-off job, a recurring job, optional waiting, and cooperative stop.
+| Example | What it demonstrates |
+| --- | --- |
+| `Basic` | Initialization, one-off/recurring jobs, wait, and cooperative stop. |
+| `JobConfig` | Worker `MemoryPolicy`, inherited task placement, and per-job `Internal` / `RequireExternal` overrides. |
+| `Events` | Synchronous Worker events and normal error reporting. |
+| `SleepAndWait` | Cooperative sleep, external sleep requests, wait, and timeout behavior. |
+| `Diagnostics` | Requested Strata placement versus observed stack/cleanup memory regions. |
+| `BindableCallbacks` | `std::bind` and private method callbacks. |
+| `TaskCleanupSentinel` | Repeated fire-and-forget cleanup while Worker general allocations and task stacks use `PreferExternal`. |
 
-## JobConfig
-
-Shows stack size, priority, core affinity, internal stack selection, and PSRAM stack requests.
-
-## Events
-
-Shows synchronous Worker event reporting. Job completion events are emitted after physical task cleanup.
-
-## SleepAndWait
-
-Shows `ctx.sleep()`, external `worker.sleep(jobId, durationMs)`, optional `waitFor()`, and timeout behavior.
-
-## Diagnostics
-
-Shows current active-job counts, cleanup queue state, cleanup-task health, and active per-job diagnostics.
-
-## BindableCallbacks
-
-Shows `std::bind` with private class methods so application classes can own job behavior.
-
-## TaskCleanupSentinel
-
-Runs fire-and-forget one-shot jobs and verifies callback capture destruction, active record cleanup, internal heap stability, PSRAM stability, and task-count recovery after allocator warm-up.
+Start with `Basic`, then use `JobConfig` and `Diagnostics` when integrating Worker memory policy into an application.
