@@ -1,6 +1,8 @@
-# Getting Started
+# Getting started
 
-Include `Worker.h`, create a `Worker` instance, and call `init()` before creating jobs.
+Worker `v0.2.0` requires Strata `v0.1.1` and C++20.
+
+PlatformIO resolves the pinned Strata dependency from Worker's `library.json`. For Arduino IDE/manual installs, place both repositories in the Arduino libraries directory.
 
 ```cpp
 #include <Arduino.h>
@@ -9,37 +11,43 @@ Include `Worker.h`, create a `Worker` instance, and call `init()` before creatin
 Worker worker;
 
 void setup() {
-	Serial.begin(115200);
+    Serial.begin(115200);
 
-	WorkerResult result = worker.init();
-	if (!result) {
-		Serial.println(result.message.c_str());
-		return;
-	}
+    WorkerConfig config;
+    config.memory.allocation = Strata::Placement::Default;
+    config.memory.taskStack = Strata::Placement::PreferExternal;
+
+    WorkerResult initResult = worker.init(config);
+    if (!initResult) {
+        Serial.println(initResult.message);
+        return;
+    }
+
+    worker.once([](WorkerJobContext &ctx) {
+        Serial.printf("job=%u\n", static_cast<unsigned>(ctx.id()));
+    });
+}
+
+void loop() {
+    delay(1000);
 }
 ```
 
-Create a fire-and-forget one-off job with `once()`.
+The default Worker task-stack policy is `PreferExternal`, which preserves the old automatic external-stack preference while allowing internal fallback. General allocations use `Placement::Default` unless configured otherwise.
+
+For a task that must stay internal:
 
 ```cpp
-worker.once([](WorkerJobContext &ctx) {
-	Serial.printf("job id=%u\n", static_cast<unsigned>(ctx.id()));
-});
+WorkerJobConfig job;
+job.stackPlacement = Strata::Placement::Internal;
+worker.once(job, [](WorkerJobContext &) {});
 ```
 
-No cleanup call is required. Worker releases the callback, task stack, TCB, and job record automatically.
-
-Create a recurring job with `every()`.
+For an application that wants all movable Worker storage and normal Worker task stacks to prefer external memory:
 
 ```cpp
-worker.every(1000, [](WorkerJobContext &ctx) {
-	Serial.println("runs every second");
-	if (ctx.runCount() >= 5) {
-		ctx.stop();
-	}
-});
+config.memory.allocation = Strata::Placement::PreferExternal;
+config.memory.taskStack = Strata::Placement::PreferExternal;
 ```
 
-`every()` delays internally after the callback returns. Do not add a delay only to protect the system from spinning.
-
-Use `waitFor()` only when application logic needs synchronization with physical task cleanup.
+Worker cleanup is automatic. `waitFor()` and `stopAndWait()` are synchronization tools only; callers never free task stacks, TCBs, queues, mutexes, or job records themselves.
