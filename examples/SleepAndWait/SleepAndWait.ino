@@ -8,7 +8,7 @@ void setup() {
 
 	WorkerResult initResult = worker.init();
 	if (!initResult) {
-		Serial.println(initResult.message.c_str());
+		Serial.println(initResult.message);
 		return;
 	}
 
@@ -25,7 +25,7 @@ void setup() {
 	if (sleeper) {
 		worker.sleep(sleeper.jobId, 1500);
 		WorkerResult waitResult = worker.waitFor(sleeper.jobId, 10000);
-		Serial.println(waitResult.message.c_str());
+		Serial.println(waitResult.message);
 	}
 
 	WorkerJobResult blocking = worker.every(1000, [](WorkerJobContext &) {
@@ -34,7 +34,7 @@ void setup() {
 
 	if (blocking) {
 		WorkerResult stopResult = worker.stopAndWait(blocking.jobId, 100);
-		Serial.println(stopResult.message.c_str());
+		Serial.println(stopResult.message);
 	}
 }
 

@@ -63,7 +63,10 @@ void runFireAndForgetBatch(size_t jobCount, std::atomic<size_t> &destroyed) {
 void setup() {
 	Serial.begin(115200);
 
-	WorkerResult initResult = worker.init();
+	WorkerConfig config;
+	config.memory.allocation = Strata::Placement::PreferExternal;
+	config.memory.taskStack = Strata::Placement::PreferExternal;
+	WorkerResult initResult = worker.init(config);
 	assert(initResult);
 
 	std::atomic<size_t> warmupDestroyed{0};

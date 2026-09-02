@@ -2,7 +2,7 @@
 
 Worker is a FreeRTOS task and cooperative job execution library for ESP32.
 
-Worker runs one-off and recurring background work with explicit task configuration, cooperative stop and sleep controls, event reporting, runtime diagnostics, and automatic task cleanup. It is designed for products that need predictable task behavior without spreading raw FreeRTOS task management across the application.
+Worker runs one-off and recurring background work with explicit task configuration, cooperative stop and sleep controls, event reporting, runtime diagnostics, and automatic task cleanup. Worker owns job orchestration and lifecycle policy while [Strata](https://github.com/ZekStack/strata) owns memory placement and low-level FreeRTOS storage.
 
 [![CI](https://github.com/ZekStack/worker/actions/workflows/ci.yml/badge.svg)](https://github.com/ZekStack/worker/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ZekStack/worker?sort=semver)](https://github.com/ZekStack/worker/releases)
@@ -12,13 +12,16 @@ Worker runs one-off and recurring background work with explicit task configurati
 
 - **Task-per-job execution** — each `once()` and `every()` job owns a FreeRTOS task.
 - **Automatic cleanup** — callers never need to reap completed jobs.
-- **Correct PSRAM teardown** — capability-created tasks are externally deleted with `vTaskDeleteWithCaps()`.
+- **Consistent memory policy** — `Strata::MemoryPolicy` controls ordinary Worker allocations and task-stack placement.
+- **Portable placement** — use `Default`, `Internal`, `PreferExternal`, and `RequireExternal` instead of Worker-specific PSRAM enums.
+- **Strata-owned FreeRTOS storage** — task stacks, task control blocks, cleanup queue storage, and mutex control storage use Strata ownership primitives.
 - **Safe recurring jobs** — `every()` applies the interval after each callback.
-- **ESP32 task control** — configure byte stack size, priority, core affinity, and stack memory preference.
 - **Cooperative lifecycle** — jobs can stop or sleep through `WorkerJobContext`.
-- **Runtime visibility** — current job and cleanup-task diagnostics without retained job history.
+- **Runtime visibility** — diagnostics expose requested stack placement and observed memory regions.
 
-## Install
+## Dependency
+
+Worker `v0.2.0` requires Strata `v0.1.1`.
 
 ### PlatformIO
 
@@ -37,13 +40,18 @@ build_unflags =
     -std=gnu++11
 ```
 
+Worker's `library.json` pins Strata `v0.1.1`, so PlatformIO resolves it as a transitive dependency.
+
 ### Arduino IDE
 
-Worker is not published to Arduino Library Manager yet. Install it by downloading the repository ZIP or cloning it into the Arduino libraries directory.
+Worker and Strata are not published to Arduino Library Manager yet. Install both repositories into the Arduino libraries directory:
 
-```txt
+```text
+Arduino/libraries/Strata
 Arduino/libraries/Worker
 ```
+
+Use Strata `v0.1.1` or a compatible later release.
 
 ## Quick start
 
@@ -59,7 +67,7 @@ void setup() {
 
     WorkerResult initResult = worker.init();
     if (!initResult) {
-        Serial.println(initResult.message.c_str());
+        Serial.println(initResult.message);
         return;
     }
 
@@ -84,23 +92,62 @@ void loop() {
 }
 ```
 
-No cleanup call is required after `once()` or `every()`. Worker releases callback captures, task stacks, task TCBs, and active job records automatically.
+No cleanup call is required after `once()` or `every()`. Worker releases callback captures, Strata task stacks and TCBs, and active job records automatically.
+
+## Memory policy
+
+Worker uses the ZekStack-standard `Strata::MemoryPolicy` configuration shape:
+
+```cpp
+WorkerConfig config;
+config.memory.allocation = Strata::Placement::PreferExternal;
+config.memory.taskStack = Strata::Placement::PreferExternal;
+
+Worker worker;
+worker.init(config);
+```
+
+`memory.allocation` controls movable Worker-owned storage such as job records, registry/completion container backing, and cleanup-queue item storage. `memory.taskStack` is the inherited default for job and cleanup task stacks.
+
+Worker's default policy preserves the old `WorkerStackType::Auto` behavior:
+
+```cpp
+allocation = Strata::Placement::Default;
+taskStack  = Strata::Placement::PreferExternal;
+```
+
+`PreferExternal` falls back to internal memory when external memory is unavailable. `RequireExternal` fails instead of consuming internal memory.
+
+A job can override only its own stack placement:
+
+```cpp
+WorkerJobConfig job;
+job.stackPlacement = Strata::Placement::Internal;
+worker.once(job, [](WorkerJobContext &) {});
+```
+
+`std::nullopt` means inherit `WorkerConfig::memory.taskStack`. `Strata::Placement::Default` never means inherit; it explicitly requests the Strata backend default.
+
+The cleanup task can be overridden independently when needed:
+
+```cpp
+config.cleanupTaskStackPlacement = Strata::Placement::Internal;
+```
 
 ## Cleanup model
 
-Worker creates one long-lived internal cleanup task during `init()`.
+Worker creates one long-lived cleanup task during `init()` using `Strata::FreeRTOS::Task` and a task-only `Strata::FreeRTOS::Queue`.
 
 When a job callback finishes, the job:
 
 1. releases its stored callback;
-2. queues its handle and immutable allocation type;
-3. suspends itself.
+2. records its final state and stack high-water mark;
+3. queues its job record to the cleanup task;
+4. reaches the external-deletion handoff and suspends.
 
-The cleanup task then deletes the job externally with the correct FreeRTOS API. Worker emits the completion event and removes the active record only after deletion returns.
+The cleanup task then externally resets the job's `Strata::FreeRTOS::Task`. Strata deletes the FreeRTOS task and releases its placed stack and internal task control block. Worker records the completion token and removes the active job record only after that reset returns.
 
-This avoids the ESP-IDF temporary-task path used when a capability-created task calls `vTaskDeleteWithCaps()` on itself.
-
-`waitFor()` and `stopAndWait()` are optional synchronization APIs. They wait for physical task cleanup; they do not perform cleanup.
+`waitFor()` and `stopAndWait()` are optional synchronization APIs. They wait for physical cleanup; they do not perform cleanup.
 
 ## Important notes
 
@@ -110,28 +157,45 @@ This avoids the ESP-IDF temporary-task path used when a capability-created task 
 - A callback that blocks forever prevents timed `stopAndWait()` and `end()` calls from completing.
 - The destructor waits without a timeout so tasks cannot outlive Worker internals.
 - `every(intervalMs, callback)` delays after each callback.
-- `WorkerStackType::Auto` prefers PSRAM task stacks when supported and falls back to internal RAM.
-- Stack sizes are FreeRTOS byte sizes on ESP32 and must be at least 1024 bytes.
+- Stack sizes remain FreeRTOS byte sizes on ESP32, must be at least 1024 bytes, and must be aligned to `sizeof(StackType_t)`.
 - `maxConcurrentJobs` bounds active jobs and guarantees cleanup queue capacity.
 - `clearFinished()` is retained only as a deprecated compatibility no-op.
 - Completion synchronization uses a small bounded token window and never retains callbacks or full completed records.
-- Worker APIs use result objects for normal failures. Catastrophic STL allocation failure is not recoverable on platforms where the standard library aborts.
+- `WorkerResult::message` is a non-owning static status string in `v0.2.0`; use `result.message` directly.
+- Worker no longer contains direct PSRAM allocation logic, capability-created task handling, or dynamic FreeRTOS queue/mutex creation.
+- `std::function` remains the callback surface. Allocation performed by a caller while constructing a callback is outside Worker's owned allocation boundary.
+
+## Diagnostics
+
+`WorkerJobDiag` separates requested policy from actual storage:
+
+```cpp
+WorkerJobDiag diag;
+if (worker.getJobDiagnostics(jobId, diag)) {
+    Serial.printf(
+        "requested=%s actual=%s\n",
+        Strata::toString(diag.requestedStackPlacement),
+        Strata::toString(diag.stackRegion));
+}
+```
+
+`WorkerDiag` also reports cleanup-task stack placement/region and cleanup-queue storage placement/region so applications can verify memory policy at runtime.
 
 ## Examples
 
 | Example | Description |
 | --- | --- |
 | `Basic` | Minimal initialization, one-off job, recurring job, wait, and cooperative stop. |
-| `JobConfig` | Stack size, priority, core affinity, internal stack, and PSRAM stack request. |
+| `JobConfig` | Worker memory policy and per-job internal/required-external stack overrides. |
 | `Events` | Event callback and error event handling. |
 | `SleepAndWait` | Context sleep, external sleep, wait, and timeout behavior. |
-| `Diagnostics` | Current job and cleanup-task diagnostics. |
+| `Diagnostics` | Requested Strata placement and observed stack/cleanup regions. |
 | `BindableCallbacks` | `std::bind` with private class methods. |
-| `TaskCleanupSentinel` | Fire-and-forget capture, heap, PSRAM, and task-count cleanup checks. |
+| `TaskCleanupSentinel` | Fire-and-forget capture, internal/external heap, and task-count cleanup checks under `PreferExternal`. |
 
 Start with:
 
-```txt
+```text
 examples/Basic
 ```
 
@@ -139,20 +203,27 @@ examples/Basic
 
 | Document | Description |
 | --- | --- |
-| [`docs/getting-started.md`](docs/getting-started.md) | Setup and first jobs. |
-| [`docs/configuration.md`](docs/configuration.md) | Job defaults and cleanup infrastructure. |
-| [`docs/api.md`](docs/api.md) | Public API and cleanup semantics. |
+| [`docs/getting-started.md`](docs/getting-started.md) | Setup, Strata dependency, and first jobs. |
+| [`docs/configuration.md`](docs/configuration.md) | Worker memory policy, job defaults, and cleanup infrastructure. |
+| [`docs/api.md`](docs/api.md) | Public API, placement diagnostics, and cleanup semantics. |
 | [`docs/examples.md`](docs/examples.md) | Example descriptions. |
-| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Common lifecycle and configuration issues. |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Common lifecycle, placement, and configuration issues. |
 
 ## API overview
 
 ```cpp
+WorkerConfig config;
+config.memory.allocation = Strata::Placement::PreferExternal;
+config.memory.taskStack = Strata::Placement::PreferExternal;
+
 Worker worker;
-worker.init();
+worker.init(config);
 worker.onEvent([](WorkerEvent event) {});
 
-WorkerJobResult once = worker.once([](WorkerJobContext &ctx) {});
+WorkerJobConfig jobConfig;
+jobConfig.stackPlacement = Strata::Placement::Internal;
+
+WorkerJobResult once = worker.once(jobConfig, [](WorkerJobContext &ctx) {});
 WorkerJobResult loop = worker.every(1000, [](WorkerJobContext &ctx) {});
 
 worker.sleep(loop.jobId, 5000);
@@ -170,11 +241,11 @@ worker.getJobDiagnostics(loop.jobId, jobDiag);
 | Framework | Arduino ESP32 |
 | Platform | `espressif32` / PIOArduino |
 | Language | C++20 |
-| Filesystem | none |
-| PSRAM | Optional task stacks through ESP-IDF capability APIs |
-| Dependencies | none |
-| Exceptions | Not used |
-| Status | Early-stage `0.1.0` |
+| Memory layer | Strata `v0.1.1` |
+| External memory | Optional through Strata placement policies |
+| Dependencies | Strata `v0.1.1` |
+| Exceptions | Not intentionally used by Worker APIs |
+| Status | `v0.2.0` API |
 
 ## License
 
@@ -182,4 +253,4 @@ MIT — see [`LICENSE.md`](LICENSE.md).
 
 ## ZekStack
 
-Part of the ZekStack ESP32 library stack.
+Part of the ZekStack ESP32 library stack. Worker is the reference adoption of the shared Strata memory-policy contract for higher-level ZekStack libraries.

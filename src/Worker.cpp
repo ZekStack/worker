@@ -1,25 +1,22 @@
 #include "Worker.h"
 
-#include "internal/WorkerMutex.h"
-#include "internal/WorkerTaskSupport.h"
+#include <strata/freertos/Mutex.h>
+#include <strata/freertos/Queue.h>
+#include <strata/freertos/Task.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <memory>
-#include <new>
+#include <optional>
 #include <utility>
-#include <vector>
-
-extern "C" {
-#include <freertos/queue.h>
-}
 
 namespace {
 constexpr WorkerJobId kInvalidJobId = 0;
 constexpr uint32_t kWaitPollMs = 10;
 constexpr size_t kMaxTaskNameLength = 32;
 constexpr size_t kCompletionCapacity = 16;
+constexpr size_t kMinStackSizeBytes = 1024;
 constexpr const char *kCleanupTaskName = "worker-cleanup";
 
 uint32_t nowMs() {
@@ -41,6 +38,10 @@ uint32_t remainingSince(uint32_t startMs, uint32_t durationMs) {
 
 TickType_t waitTicks(uint32_t durationMs) {
 	return durationMs == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(durationMs);
+}
+
+bool isValidStackSize(size_t stackBytes) {
+	return stackBytes >= kMinStackSizeBytes && (stackBytes % sizeof(StackType_t)) == 0;
 }
 
 bool isExecutionCompleteState(WorkerJobState state) {
@@ -68,12 +69,38 @@ void copyTaskName(char *destination, size_t destinationSize, const char *source)
 	std::strncpy(destination, source, destinationSize - 1);
 	destination[destinationSize - 1] = '\0';
 }
-} // namespace
 
-enum class WorkerTaskAllocation : uint8_t {
-	Internal,
-	WithCaps,
+class WorkerLock {
+  public:
+	explicit WorkerLock(Strata::FreeRTOS::RecursiveMutex &mutex)
+	    : _mutex(mutex), _locked(mutex.lock()) {
+	}
+
+	~WorkerLock() {
+		if (_locked) {
+			_mutex.unlock();
+		}
+	}
+
+	WorkerLock(const WorkerLock &) = delete;
+	WorkerLock &operator=(const WorkerLock &) = delete;
+
+	explicit operator bool() const {
+		return _locked;
+	}
+
+  private:
+	Strata::FreeRTOS::RecursiveMutex &_mutex;
+	bool _locked = false;
 };
+
+[[noreturn]] void suspendForever() {
+	vTaskSuspend(nullptr);
+	for (;;) {
+		vTaskDelay(portMAX_DELAY);
+	}
+}
+} // namespace
 
 struct WorkerJobRecord {
 	WorkerImpl *owner = nullptr;
@@ -85,10 +112,8 @@ struct WorkerJobRecord {
 	uint32_t stackSize = 0;
 	UBaseType_t priority = 0;
 	BaseType_t coreId = tskNO_AFFINITY;
-	WorkerStackType requestedStackType = WorkerStackType::Auto;
-	WorkerStackType actualStackType = WorkerStackType::Internal;
-	WorkerTaskAllocation allocation = WorkerTaskAllocation::Internal;
-	TaskHandle_t taskHandle = nullptr;
+	Strata::Placement requestedStackPlacement = Strata::Placement::Default;
+	Strata::FreeRTOS::Task task;
 	std::atomic<bool> stopRequested{false};
 	std::atomic<bool> readyForDelete{false};
 	WorkerJobState state = WorkerJobState::Created;
@@ -111,20 +136,26 @@ struct WorkerCompletion {
 
 struct WorkerCleanupRequest {
 	WorkerJobId jobId = kInvalidJobId;
-	TaskHandle_t taskHandle = nullptr;
 	WorkerJobRecord *record = nullptr;
-	bool withCaps = false;
 	bool stopCleanupTask = false;
 };
 
+using WorkerJobPtr = Strata::UniquePtr<WorkerJobRecord>;
+using WorkerJobs = Strata::Vector<WorkerJobPtr>;
+using WorkerCompletions = Strata::Vector<WorkerCompletion>;
+using WorkerCleanupQueue = Strata::FreeRTOS::Queue<WorkerCleanupRequest>;
+
 struct WorkerImpl {
+	WorkerImpl() noexcept : mutex(Strata::FreeRTOS::RecursiveMutex::create()) {
+	}
+
 	WorkerConfig config{};
-	WorkerMutex mutex;
-	std::vector<std::unique_ptr<WorkerJobRecord>> jobs;
-	std::vector<WorkerCompletion> completions;
-	WorkerEventCallback onEvent;
-	QueueHandle_t cleanupQueue = nullptr;
-	TaskHandle_t cleanupTaskHandle = nullptr;
+	Strata::FreeRTOS::RecursiveMutex mutex;
+	std::optional<WorkerJobs> jobs;
+	std::optional<WorkerCompletions> completions;
+	std::shared_ptr<WorkerEventCallback> onEvent;
+	WorkerCleanupQueue cleanupQueue;
+	Strata::FreeRTOS::Task cleanupTask;
 	bool cleanupTaskRunning = false;
 	bool cleanupTaskStopRequested = false;
 	std::atomic<bool> cleanupTaskReadyForDelete{false};
@@ -133,16 +164,25 @@ struct WorkerImpl {
 	bool ending = false;
 	WorkerJobId nextJobId = 1;
 
+	void initializeStorage(Strata::Placement placement, size_t maxConcurrentJobs) {
+		jobs.reset();
+		completions.reset();
+		jobs.emplace(Strata::Allocator<WorkerJobPtr>{placement});
+		completions.emplace(Strata::Allocator<WorkerCompletion>{placement});
+		jobs->reserve(maxConcurrentJobs);
+		completions->reserve(kCompletionCapacity);
+	}
+
 	WorkerResult emitResult(WorkerResult result, WorkerJobId jobId = kInvalidJobId) {
 		if (!result) {
-			emitEvent(WorkerEventType::Error, result.status, jobId, result.message.c_str());
+			emitEvent(WorkerEventType::Error, result.status, jobId, result.message);
 		}
 		return result;
 	}
 
 	WorkerJobResult emitJobResult(WorkerJobResult result) {
 		if (!result) {
-			emitEvent(WorkerEventType::Error, result.status, result.jobId, result.message.c_str());
+			emitEvent(WorkerEventType::Error, result.status, result.jobId, result.message);
 		}
 		return result;
 	}
@@ -153,7 +193,7 @@ struct WorkerImpl {
 	    WorkerJobId jobId,
 	    const char *message
 	) {
-		WorkerEventCallback callback;
+		std::shared_ptr<WorkerEventCallback> callback;
 		{
 			WorkerLock lock(mutex);
 			if (!lock) {
@@ -161,13 +201,16 @@ struct WorkerImpl {
 			}
 			callback = onEvent;
 		}
-		if (callback) {
-			callback(WorkerEvent{type, status, jobId, message != nullptr ? message : "event"});
+		if (callback && *callback) {
+			(*callback)(WorkerEvent{type, status, jobId, message != nullptr ? message : "event"});
 		}
 	}
 
 	WorkerJobRecord *findJob(WorkerJobId jobId) {
-		for (auto &job : jobs) {
+		if (!jobs) {
+			return nullptr;
+		}
+		for (auto &job : *jobs) {
 			if (job && job->id == jobId) {
 				return job.get();
 			}
@@ -176,52 +219,62 @@ struct WorkerImpl {
 	}
 
 	bool hasCompletion(WorkerJobId jobId) const {
+		if (!completions) {
+			return false;
+		}
 		return std::any_of(
-		    completions.begin(),
-		    completions.end(),
+		    completions->begin(),
+		    completions->end(),
 		    [jobId](const WorkerCompletion &completion) { return completion.jobId == jobId; }
 		);
 	}
 
 	bool consumeCompletion(WorkerJobId jobId, WorkerJobState &finalState) {
+		if (!completions) {
+			return false;
+		}
 		auto it = std::find_if(
-		    completions.begin(),
-		    completions.end(),
+		    completions->begin(),
+		    completions->end(),
 		    [jobId](const WorkerCompletion &completion) { return completion.jobId == jobId; }
 		);
-		if (it == completions.end()) {
+		if (it == completions->end()) {
 			return false;
 		}
 		finalState = it->finalState;
-		completions.erase(it);
+		completions->erase(it);
 		return true;
 	}
 
 	void recordCompletion(WorkerJobId jobId, WorkerJobState finalState) {
-		completions.erase(
+		if (!completions) {
+			return;
+		}
+		completions->erase(
 		    std::remove_if(
-		        completions.begin(),
-		        completions.end(),
+		        completions->begin(),
+		        completions->end(),
 		        [jobId](const WorkerCompletion &completion) { return completion.jobId == jobId; }
 		    ),
-		    completions.end()
+		    completions->end()
 		);
-		if (completions.size() >= kCompletionCapacity) {
-			completions.erase(completions.begin());
+		if (completions->size() >= kCompletionCapacity) {
+			completions->erase(completions->begin());
 		}
-		completions.push_back(WorkerCompletion{jobId, finalState});
+		completions->push_back(WorkerCompletion{jobId, finalState});
 	}
 
 	void eraseJob(WorkerJobId jobId) {
-		jobs.erase(
+		if (!jobs) {
+			return;
+		}
+		jobs->erase(
 		    std::remove_if(
-		        jobs.begin(),
-		        jobs.end(),
-		        [jobId](const std::unique_ptr<WorkerJobRecord> &job) {
-			        return job && job->id == jobId;
-		        }
+		        jobs->begin(),
+		        jobs->end(),
+		        [jobId](const WorkerJobPtr &job) { return job && job->id == jobId; }
 		    ),
-		    jobs.end()
+		    jobs->end()
 		);
 	}
 
@@ -282,7 +335,6 @@ struct WorkerImpl {
 		jobConfig.stackSize = config.defaultStackSize;
 		jobConfig.priority = config.defaultPriority;
 		jobConfig.coreId = config.defaultCoreId;
-		jobConfig.stackType = config.defaultStackType;
 		return jobConfig;
 	}
 
@@ -295,6 +347,14 @@ struct WorkerImpl {
 			resolved.priority = config.defaultPriority;
 		}
 		return resolved;
+	}
+
+	Strata::Placement resolveJobStackPlacement(const WorkerJobConfig &jobConfig) const {
+		return jobConfig.stackPlacement.value_or(config.memory.taskStack);
+	}
+
+	Strata::Placement resolveCleanupStackPlacement(const WorkerConfig &incomingConfig) const {
+		return incomingConfig.cleanupTaskStackPlacement.value_or(incomingConfig.memory.taskStack);
 	}
 
 	void markRunStart(WorkerJobRecord *job) {
@@ -387,24 +447,19 @@ struct WorkerImpl {
 		return finalState;
 	}
 
-	void prepareCleanup(
-	    WorkerJobRecord *job,
-	    WorkerJobState finalState,
-	    TaskHandle_t taskHandle
-	) {
+	void prepareCleanup(WorkerJobRecord *job, WorkerJobState finalState) {
 		WorkerLock lock(mutex);
 		if (!lock || job == nullptr) {
 			return;
 		}
-		job->stackHighWaterMarkBytes = worker_task_support::currentStackHighWaterMarkBytes();
+		job->stackHighWaterMarkBytes = job->task.stackHighWaterMarkBytes();
 		job->finalState = finalState;
 		job->state = WorkerJobState::CallbackComplete;
 		job->finishedAtMs = nowMs();
-		job->taskHandle = taskHandle;
 	}
 
-	void queueCleanup(WorkerJobRecord *job, TaskHandle_t taskHandle) {
-		if (job == nullptr || cleanupQueue == nullptr) {
+	void queueCleanup(WorkerJobRecord *job) {
+		if (job == nullptr || !cleanupQueue) {
 			return;
 		}
 		{
@@ -414,18 +469,13 @@ struct WorkerImpl {
 			}
 		}
 
-		const WorkerCleanupRequest request{
-		    job->id,
-		    taskHandle,
-		    job,
-		    job->allocation == WorkerTaskAllocation::WithCaps,
-		    false,
-		};
-		while (xQueueSend(cleanupQueue, &request, portMAX_DELAY) != pdPASS) {
+		const WorkerCleanupRequest request{job->id, job, false};
+		while (!cleanupQueue.send(request, portMAX_DELAY)) {
 			vTaskDelay(1);
 		}
 
-		const uint32_t queueDepth = static_cast<uint32_t>(uxQueueMessagesWaiting(cleanupQueue));
+		const uint32_t queueDepth =
+		    static_cast<uint32_t>(uxQueueMessagesWaiting(cleanupQueue.handle()));
 		WorkerLock lock(mutex);
 		if (lock) {
 			cleanupQueueHighWaterMark = std::max(cleanupQueueHighWaterMark, queueDepth);
@@ -484,33 +534,24 @@ struct WorkerImpl {
 			    "interval must be greater than zero"
 			));
 		}
+		if (incomingConfig.stackPlacement &&
+		    !Strata::validPlacement(*incomingConfig.stackPlacement)) {
+			return emitJobResult(WorkerJobResult::failure(
+			    WorkerStatus::InvalidArgument,
+			    "invalid stack placement"
+			));
+		}
 
 		const WorkerJobConfig jobConfig = resolveJobConfig(incomingConfig);
-		if (!worker_task_support::isValidStackSize(jobConfig.stackSize)) {
+		if (!isValidStackSize(jobConfig.stackSize)) {
 			return emitJobResult(WorkerJobResult::failure(
 			    WorkerStatus::InvalidArgument,
 			    "stack size must be at least 1024 bytes and aligned"
 			));
 		}
+		const Strata::Placement stackPlacement = resolveJobStackPlacement(jobConfig);
 
-		bool usePsramStack = false;
-		WorkerStackType actualStackType = WorkerStackType::Internal;
-		if (jobConfig.stackType == WorkerStackType::Psram) {
-			if (!worker_task_support::hasExternalStackSupport()) {
-				return emitJobResult(WorkerJobResult::failure(
-				    WorkerStatus::TaskCreateFailed,
-				    "PSRAM task stacks are not available"
-				));
-			}
-			usePsramStack = true;
-			actualStackType = WorkerStackType::Psram;
-		} else if (jobConfig.stackType == WorkerStackType::Auto &&
-		           worker_task_support::hasExternalStackSupport()) {
-			usePsramStack = true;
-			actualStackType = WorkerStackType::Psram;
-		}
-
-		std::unique_ptr<WorkerJobRecord> job(new (std::nothrow) WorkerJobRecord());
+		auto job = Strata::makeUnique<WorkerJobRecord>(config.memory.allocation);
 		if (!job) {
 			return emitJobResult(WorkerJobResult::failure(
 			    WorkerStatus::OutOfMemory,
@@ -525,11 +566,7 @@ struct WorkerImpl {
 		job->stackSize = jobConfig.stackSize;
 		job->priority = jobConfig.priority;
 		job->coreId = jobConfig.coreId;
-		job->requestedStackType = jobConfig.stackType;
-		job->actualStackType = actualStackType;
-		job->allocation = usePsramStack
-		    ? WorkerTaskAllocation::WithCaps
-		    : WorkerTaskAllocation::Internal;
+		job->requestedStackPlacement = stackPlacement;
 		if (jobConfig.name != nullptr && *jobConfig.name != '\0') {
 			copyTaskName(job->name, sizeof(job->name), jobConfig.name);
 		}
@@ -543,7 +580,7 @@ struct WorkerImpl {
 				    "failed to lock worker registry"
 				));
 			}
-			if (!initialized || cleanupQueue == nullptr || cleanupTaskHandle == nullptr) {
+			if (!initialized || !cleanupQueue || !cleanupTask) {
 				return emitJobResult(WorkerJobResult::failure(
 				    WorkerStatus::NotInitialized,
 				    "worker is not initialized"
@@ -555,7 +592,7 @@ struct WorkerImpl {
 				    "worker is ending"
 				));
 			}
-			if (jobs.size() >= config.maxConcurrentJobs) {
+			if (!jobs || jobs->size() >= config.maxConcurrentJobs) {
 				return emitJobResult(WorkerJobResult::failure(
 				    WorkerStatus::Busy,
 				    "maximum concurrent jobs reached"
@@ -565,20 +602,20 @@ struct WorkerImpl {
 			job->id = allocateJobId();
 			WorkerJobRecord *jobRecord = job.get();
 			const WorkerJobId jobId = job->id;
-			jobs.push_back(std::move(job));
+			jobs->push_back(std::move(job));
 
-			TaskHandle_t handle = nullptr;
-			const BaseType_t created = worker_task_support::createTask(
+			auto task = Strata::FreeRTOS::Task::create(
 			    &WorkerImpl::taskEntry,
-			    jobRecord->name,
-			    jobRecord->stackSize,
 			    jobRecord,
-			    jobRecord->priority,
-			    &handle,
-			    jobRecord->coreId,
-			    usePsramStack
+			    Strata::FreeRTOS::TaskConfig{
+			        .name = jobRecord->name,
+			        .stackBytes = jobRecord->stackSize,
+			        .stackPlacement = stackPlacement,
+			        .priority = jobRecord->priority,
+			        .affinity = jobRecord->coreId,
+			    }
 			);
-			if (created != pdPASS || handle == nullptr) {
+			if (!task) {
 				eraseJob(jobId);
 				result = WorkerJobResult::failure(
 				    WorkerStatus::TaskCreateFailed,
@@ -586,7 +623,8 @@ struct WorkerImpl {
 				    jobId
 				);
 			} else {
-				jobRecord->taskHandle = handle;
+				jobRecord->task = std::move(task);
+				xTaskNotifyGive(jobRecord->task.handle());
 				result = WorkerJobResult::success(jobId, "job started");
 			}
 		}
@@ -594,48 +632,48 @@ struct WorkerImpl {
 	}
 
 	bool initializeCleanupInfrastructure(const WorkerConfig &incomingConfig) {
-		cleanupQueue = xQueueCreate(
-		    static_cast<UBaseType_t>(incomingConfig.maxConcurrentJobs),
-		    sizeof(WorkerCleanupRequest)
-		);
-		if (cleanupQueue == nullptr) {
+		cleanupQueue = WorkerCleanupQueue::create({
+		    .length = incomingConfig.maxConcurrentJobs,
+		    .storagePlacement = incomingConfig.memory.allocation,
+		    .usage = Strata::FreeRTOS::QueueUsage::TaskOnly,
+		});
+		if (!cleanupQueue) {
 			return false;
 		}
+
 		cleanupTaskReadyForDelete.store(false);
 		cleanupTaskStopRequested = false;
 		cleanupTaskRunning = false;
 		cleanupQueueHighWaterMark = 0;
-		cleanupTaskHandle = nullptr;
-		const BaseType_t created = worker_task_support::createInternalTask(
+		const Strata::Placement stackPlacement = resolveCleanupStackPlacement(incomingConfig);
+		auto task = Strata::FreeRTOS::Task::create(
 		    &WorkerImpl::cleanupTaskEntry,
-		    kCleanupTaskName,
-		    incomingConfig.cleanupTaskStackSize,
 		    this,
-		    incomingConfig.cleanupTaskPriority,
-		    &cleanupTaskHandle,
-		    incomingConfig.cleanupTaskCoreId
+		    Strata::FreeRTOS::TaskConfig{
+		        .name = kCleanupTaskName,
+		        .stackBytes = incomingConfig.cleanupTaskStackSize,
+		        .stackPlacement = stackPlacement,
+		        .priority = incomingConfig.cleanupTaskPriority,
+		        .affinity = incomingConfig.cleanupTaskCoreId,
+		    }
 		);
-		if (created != pdPASS || cleanupTaskHandle == nullptr) {
-			vQueueDelete(cleanupQueue);
-			cleanupQueue = nullptr;
-			cleanupTaskHandle = nullptr;
+		if (!task) {
+			cleanupQueue.reset();
 			return false;
 		}
+		cleanupTask = std::move(task);
+		xTaskNotifyGive(cleanupTask.handle());
 		return true;
 	}
 
 	WorkerResult stopCleanupInfrastructure(uint32_t startMs, uint32_t timeoutMs) {
-		QueueHandle_t queue = nullptr;
-		TaskHandle_t handle = nullptr;
 		bool sendStop = false;
 		{
 			WorkerLock lock(mutex);
 			if (!lock) {
 				return WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 			}
-			queue = cleanupQueue;
-			handle = cleanupTaskHandle;
-			if (queue == nullptr || handle == nullptr) {
+			if (!cleanupQueue || !cleanupTask) {
 				return WorkerResult::success("cleanup task already stopped");
 			}
 			if (!cleanupTaskStopRequested) {
@@ -645,14 +683,8 @@ struct WorkerImpl {
 		}
 
 		if (sendStop) {
-			const WorkerCleanupRequest stopRequest{
-			    kInvalidJobId,
-			    nullptr,
-			    nullptr,
-			    false,
-			    true,
-			};
-			if (xQueueSend(queue, &stopRequest, 0) != pdPASS) {
+			const WorkerCleanupRequest stopRequest{kInvalidJobId, nullptr, true};
+			if (!cleanupQueue.send(stopRequest, 0)) {
 				WorkerLock lock(mutex);
 				if (lock) {
 					cleanupTaskStopRequested = false;
@@ -664,54 +696,50 @@ struct WorkerImpl {
 			}
 		}
 
-		while (!cleanupTaskReadyForDelete.load()) {
+		while (!cleanupTaskReadyForDelete.load(std::memory_order_acquire)) {
 			if (elapsedSince(startMs, timeoutMs)) {
 				return WorkerResult::failure(WorkerStatus::Timeout, "worker end timed out");
 			}
 			vTaskDelay(pdMS_TO_TICKS(kWaitPollMs));
 		}
 
-		worker_task_support::deleteTask(handle, false);
+		vTaskSuspend(cleanupTask.handle());
+		cleanupTask.reset();
+		cleanupQueue.reset();
 		{
 			WorkerLock lock(mutex);
 			if (lock) {
-				cleanupTaskHandle = nullptr;
 				cleanupTaskRunning = false;
 				cleanupTaskStopRequested = false;
 				cleanupTaskReadyForDelete.store(false);
-				cleanupQueue = nullptr;
 			}
 		}
-		vQueueDelete(queue);
 		return WorkerResult::success("cleanup task stopped");
 	}
 
 	static void taskEntry(void *arg) {
 		auto *job = static_cast<WorkerJobRecord *>(arg);
 		if (job == nullptr || job->owner == nullptr) {
-			vTaskDelete(nullptr);
-			return;
+			suspendForever();
 		}
 
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 		WorkerImpl *owner = job->owner;
-		const TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
 		const WorkerJobState finalState = owner->executeJob(job);
-		owner->prepareCleanup(job, finalState, currentTask);
-		owner->queueCleanup(job, currentTask);
+		owner->prepareCleanup(job, finalState);
+		owner->queueCleanup(job);
 
 		job->readyForDelete.store(true, std::memory_order_release);
-		vTaskSuspend(nullptr);
-		for (;;) {
-			vTaskDelay(portMAX_DELAY);
-		}
+		suspendForever();
 	}
 
 	static void cleanupTaskEntry(void *arg) {
 		auto *owner = static_cast<WorkerImpl *>(arg);
 		if (owner == nullptr) {
-			vTaskDelete(nullptr);
-			return;
+			suspendForever();
 		}
+
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 		{
 			WorkerLock lock(owner->mutex);
 			if (lock) {
@@ -721,7 +749,7 @@ struct WorkerImpl {
 
 		for (;;) {
 			WorkerCleanupRequest request;
-			if (xQueueReceive(owner->cleanupQueue, &request, portMAX_DELAY) != pdPASS) {
+			if (!owner->cleanupQueue.receive(request, portMAX_DELAY)) {
 				continue;
 			}
 			if (request.stopCleanupTask) {
@@ -732,19 +760,17 @@ struct WorkerImpl {
 					}
 				}
 				owner->cleanupTaskReadyForDelete.store(true, std::memory_order_release);
-				vTaskSuspend(nullptr);
-				for (;;) {
-					vTaskDelay(portMAX_DELAY);
-				}
+				suspendForever();
 			}
 
-			if (request.record == nullptr || request.taskHandle == nullptr) {
+			if (request.record == nullptr || !request.record->task) {
 				continue;
 			}
 			while (!request.record->readyForDelete.load(std::memory_order_acquire)) {
 				taskYIELD();
 			}
-			worker_task_support::deleteTask(request.taskHandle, request.withCaps);
+			vTaskSuspend(request.record->task.handle());
+			request.record->task.reset();
 			owner->completeCleanup(request);
 		}
 	}
@@ -836,7 +862,7 @@ uint64_t WorkerJobContext::lastRunAtMs() const {
 	return lock ? _record->lastRunAtMs : 0;
 }
 
-Worker::Worker() : _impl(new (std::nothrow) WorkerImpl()) {
+Worker::Worker() : _impl(Strata::makeUnique<WorkerImpl>(Strata::Placement::Internal)) {
 }
 
 Worker::~Worker() {
@@ -849,8 +875,19 @@ WorkerResult Worker::init(const WorkerConfig &config) {
 	if (!_impl) {
 		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker");
 	}
-	if (!worker_task_support::isValidStackSize(config.defaultStackSize) ||
-	    !worker_task_support::isValidStackSize(config.cleanupTaskStackSize)) {
+	if (!_impl->mutex) {
+		return WorkerResult::failure(WorkerStatus::OutOfMemory, "failed to allocate worker mutex");
+	}
+	if (!Strata::validMemoryPolicy(config.memory) ||
+	    (config.cleanupTaskStackPlacement &&
+	     !Strata::validPlacement(*config.cleanupTaskStackPlacement))) {
+		return _impl->emitResult(WorkerResult::failure(
+		    WorkerStatus::InvalidArgument,
+		    "invalid memory placement"
+		));
+	}
+	if (!isValidStackSize(config.defaultStackSize) ||
+	    !isValidStackSize(config.cleanupTaskStackSize)) {
 		return _impl->emitResult(WorkerResult::failure(
 		    WorkerStatus::InvalidArgument,
 		    "task stack sizes must be at least 1024 bytes and aligned"
@@ -880,8 +917,7 @@ WorkerResult Worker::init(const WorkerConfig &config) {
 			_impl->config = config;
 			_impl->ending = false;
 			_impl->nextJobId = 1;
-			_impl->jobs.clear();
-			_impl->completions.clear();
+			_impl->initializeStorage(config.memory.allocation, config.maxConcurrentJobs);
 			if (!_impl->initializeCleanupInfrastructure(config)) {
 				failure = WorkerResult::failure(
 				    WorkerStatus::TaskCreateFailed,
@@ -904,9 +940,16 @@ void Worker::onEvent(WorkerEventCallback callback) {
 	if (!_impl) {
 		return;
 	}
+	std::shared_ptr<WorkerEventCallback> holder;
+	if (callback) {
+		holder = Strata::makeShared<WorkerEventCallback>(
+		    Strata::Placement::Internal,
+		    std::move(callback)
+		);
+	}
 	WorkerLock lock(_impl->mutex);
 	if (lock) {
-		_impl->onEvent = std::move(callback);
+		_impl->onEvent = std::move(holder);
 	}
 }
 
@@ -974,7 +1017,7 @@ WorkerResult Worker::stop(WorkerJobId jobId) {
 			} else {
 				job->stopRequested.store(true);
 				job->state = WorkerJobState::Stopping;
-				handle = job->taskHandle;
+				handle = job->task.handle();
 			}
 		}
 	}
@@ -1012,7 +1055,7 @@ WorkerResult Worker::stopAndWait(WorkerJobId jobId, uint32_t timeoutMs) {
 			} else if (!isExecutionCompleteState(job->state)) {
 				job->stopRequested.store(true);
 				job->state = WorkerJobState::Stopping;
-				handle = job->taskHandle;
+				handle = job->task.handle();
 			}
 		}
 	}
@@ -1062,7 +1105,7 @@ WorkerResult Worker::sleep(WorkerJobId jobId, uint32_t durationMs) {
 				job->sleepDurationMs = std::max(existingRemainingMs, durationMs);
 				job->hasSleepDeadline = true;
 				job->state = WorkerJobState::Sleeping;
-				handle = job->taskHandle;
+				handle = job->task.handle();
 			}
 		}
 	}
@@ -1103,37 +1146,45 @@ WorkerDiag Worker::getDiagnostics() {
 		return diag;
 	}
 
-	diag.activeJobCount = static_cast<uint32_t>(_impl->jobs.size());
+	diag.activeJobCount = _impl->jobs ? static_cast<uint32_t>(_impl->jobs->size()) : 0;
 	diag.cleanupTaskRunning = _impl->cleanupTaskRunning;
 	diag.cleanupQueueHighWaterMark = _impl->cleanupQueueHighWaterMark;
-	if (_impl->cleanupQueue != nullptr) {
+	if (_impl->cleanupQueue) {
 		diag.cleanupQueueDepth =
-		    static_cast<uint32_t>(uxQueueMessagesWaiting(_impl->cleanupQueue));
+		    static_cast<uint32_t>(uxQueueMessagesWaiting(_impl->cleanupQueue.handle()));
+		diag.cleanupQueueStoragePlacement = _impl->cleanupQueue.storagePlacement();
+		diag.cleanupQueueStorageRegion = _impl->cleanupQueue.storageRegion();
 	}
-	for (const auto &job : _impl->jobs) {
-		if (!job) {
-			continue;
-		}
-		switch (job->state) {
-		case WorkerJobState::Running:
-			diag.runningJobCount++;
-			break;
-		case WorkerJobState::Sleeping:
-			diag.sleepingJobCount++;
-			break;
-		case WorkerJobState::Stopping:
-			diag.stoppingJobCount++;
-			break;
-		case WorkerJobState::CallbackComplete:
-		case WorkerJobState::CleanupQueued:
-			diag.cleanupQueuedCount++;
-			break;
-		case WorkerJobState::Created:
-		case WorkerJobState::CleanupComplete:
-		case WorkerJobState::Stopped:
-		case WorkerJobState::Finished:
-		case WorkerJobState::Failed:
-			break;
+	if (_impl->cleanupTask) {
+		diag.cleanupTaskStackPlacement = _impl->cleanupTask.stackPlacement();
+		diag.cleanupTaskStackRegion = _impl->cleanupTask.stackRegion();
+	}
+	if (_impl->jobs) {
+		for (const auto &job : *_impl->jobs) {
+			if (!job) {
+				continue;
+			}
+			switch (job->state) {
+			case WorkerJobState::Running:
+				diag.runningJobCount++;
+				break;
+			case WorkerJobState::Sleeping:
+				diag.sleepingJobCount++;
+				break;
+			case WorkerJobState::Stopping:
+				diag.stoppingJobCount++;
+				break;
+			case WorkerJobState::CallbackComplete:
+			case WorkerJobState::CleanupQueued:
+				diag.cleanupQueuedCount++;
+				break;
+			case WorkerJobState::Created:
+			case WorkerJobState::CleanupComplete:
+			case WorkerJobState::Stopped:
+			case WorkerJobState::Finished:
+			case WorkerJobState::Failed:
+				break;
+			}
 		}
 	}
 	return diag;
@@ -1162,13 +1213,15 @@ WorkerResult Worker::getJobDiagnostics(WorkerJobId jobId, WorkerJobDiag &out) {
 				out.stackSize = job->stackSize;
 				out.priority = job->priority;
 				out.coreId = job->coreId;
-				out.requestedStackType = job->requestedStackType;
-				out.actualStackType = job->actualStackType;
+				out.requestedStackPlacement = job->requestedStackPlacement;
+				out.stackRegion = job->task ? job->task.stackRegion() : Strata::Region::Unknown;
 				out.runCount = job->runCount;
 				out.startedAtMs = job->startedAtMs;
 				out.lastRunAtMs = job->lastRunAtMs;
 				out.finishedAtMs = job->finishedAtMs;
-				out.stackHighWaterMarkBytes = job->stackHighWaterMarkBytes;
+				out.stackHighWaterMarkBytes = job->task
+				    ? job->task.stackHighWaterMarkBytes()
+				    : job->stackHighWaterMarkBytes;
 			}
 		}
 	}
@@ -1184,7 +1237,6 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 	}
 
 	const uint32_t startMs = nowMs();
-	std::vector<TaskHandle_t> handles;
 	{
 		WorkerLock lock(_impl->mutex);
 		if (!lock) {
@@ -1194,19 +1246,18 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 			return WorkerResult::success("worker not initialized");
 		}
 		_impl->ending = true;
-		for (auto &job : _impl->jobs) {
-			if (!job || isExecutionCompleteState(job->state)) {
-				continue;
-			}
-			job->stopRequested.store(true);
-			job->state = WorkerJobState::Stopping;
-			if (job->taskHandle != nullptr) {
-				handles.push_back(job->taskHandle);
+		if (_impl->jobs) {
+			for (auto &job : *_impl->jobs) {
+				if (!job || isExecutionCompleteState(job->state)) {
+					continue;
+				}
+				job->stopRequested.store(true);
+				job->state = WorkerJobState::Stopping;
+				if (job->task) {
+					xTaskNotifyGive(job->task.handle());
+				}
 			}
 		}
-	}
-	for (TaskHandle_t handle : handles) {
-		xTaskNotifyGive(handle);
 	}
 
 	while (true) {
@@ -1216,7 +1267,7 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 			if (!lock) {
 				return WorkerResult::failure(WorkerStatus::InternalError, "failed to lock worker");
 			}
-			jobsEmpty = _impl->jobs.empty();
+			jobsEmpty = !_impl->jobs || _impl->jobs->empty();
 		}
 		if (jobsEmpty) {
 			break;
@@ -1237,8 +1288,12 @@ WorkerResult Worker::end(uint32_t timeoutMs) {
 	{
 		WorkerLock lock(_impl->mutex);
 		if (lock) {
-			_impl->jobs.clear();
-			_impl->completions.clear();
+			if (_impl->jobs) {
+				_impl->jobs->clear();
+			}
+			if (_impl->completions) {
+				_impl->completions->clear();
+			}
 			_impl->nextJobId = 1;
 			_impl->initialized = false;
 			_impl->ending = false;

@@ -15,6 +15,7 @@ env:
   PIOARDUINO_PLATFORM_URL: https://github.com/pioarduino/platform-espressif32/releases/download/55.03.39/platform-espressif32.zip
   PIOARDUINO_PLATFORM_VERSION: 55.03.39
   PIOARDUINO_VERSION: 6.1.19
+  STRATA_VERSION: v0.1.1
 
 jobs:
   source-audit:
@@ -25,8 +26,19 @@ jobs:
 
       - name: Audit production sources
         run: |
+          set -e
           if grep -RInE '(^|[^[:alnum:]_])throw([^[:alnum:]_]|$)|std::abort[[:space:]]*\(' src; then
             echo "Embedded safety audit failed"
+            exit 1
+          fi
+
+          if grep -RInE 'heap_caps_|MALLOC_CAP_|ps_malloc|xTaskCreate|vTaskDelete|xQueueCreate|xSemaphoreCreate|std::make_unique|std::make_shared|(^|[^[:alnum:]_])malloc[[:space:]]*\(|(^|[^[:alnum:]_])calloc[[:space:]]*\(|(^|[^[:alnum:]_])realloc[[:space:]]*\(|(^|[^[:alnum:]_])free[[:space:]]*\(|(^|[^[:alnum:]_])new[[:space:](]|(^|[^[:alnum:]_])delete[[:space:](]' src; then
+            echo "Worker allocations and owned FreeRTOS primitives must route through Strata"
+            exit 1
+          fi
+
+          if grep -RInE '#include[[:space:]]+[<"]esp_heap_caps\.h[>"]|freertos/idf_additions\.h' src; then
+            echo "Worker must not depend on ESP-IDF allocation internals"
             exit 1
           fi
 
@@ -72,6 +84,7 @@ jobs:
                 --board ${{ matrix.board }} \
                 --lib="." \
                 --project-option "platform=${PIOARDUINO_PLATFORM_URL}" \
+                --project-option "lib_deps=https://github.com/ZekStack/strata.git#${STRATA_VERSION}" \
                 --project-option "build_unflags=-std=gnu++11" \
                 --project-option "build_flags=-std=gnu++20"
             fi
@@ -152,12 +165,16 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}"
 
-      - name: Add local library to sketchbook
+      - name: Add local libraries to sketchbook
         run: |
           set -e
           SKETCHBOOK_DIR="${HOME}/Arduino"
           mkdir -p "$SKETCHBOOK_DIR/libraries/Worker"
           rsync -a --delete --exclude ".git" ./ "$SKETCHBOOK_DIR/libraries/Worker/"
+          rm -rf "$SKETCHBOOK_DIR/libraries/Strata"
+          git clone --depth 1 --branch "${STRATA_VERSION}" \
+            https://github.com/ZekStack/strata.git \
+            "$SKETCHBOOK_DIR/libraries/Strata"
 
       - name: Build examples (${{ matrix.board.name }})
         env:

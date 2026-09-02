@@ -1,11 +1,12 @@
 #pragma once
 
 #include <Arduino.h>
+#include <Strata.h>
+
 #include <atomic>
 #include <cstddef>
 #include <functional>
-#include <memory>
-#include <string>
+#include <optional>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -31,12 +32,6 @@ enum class WorkerStatus : uint8_t {
 	Busy,
 	Timeout,
 	InternalError,
-};
-
-enum class WorkerStackType : uint8_t {
-	Auto,
-	Internal,
-	Psram,
 };
 
 enum class WorkerEventType : uint8_t {
@@ -70,29 +65,34 @@ struct WorkerEvent {
 };
 
 struct WorkerConfig {
+	Strata::MemoryPolicy memory{
+	    .allocation = Strata::Placement::Default,
+	    .taskStack = Strata::Placement::PreferExternal,
+	};
+
 	uint32_t defaultStackSize = 4096;
 	UBaseType_t defaultPriority = 1;
 	BaseType_t defaultCoreId = tskNO_AFFINITY;
-	WorkerStackType defaultStackType = WorkerStackType::Auto;
 
 	size_t maxConcurrentJobs = 8;
 	uint32_t cleanupTaskStackSize = 3072;
 	UBaseType_t cleanupTaskPriority = 1;
 	BaseType_t cleanupTaskCoreId = tskNO_AFFINITY;
+	std::optional<Strata::Placement> cleanupTaskStackPlacement{};
 };
 
 struct WorkerJobConfig {
 	uint32_t stackSize = 0;
 	UBaseType_t priority = 0;
 	BaseType_t coreId = tskNO_AFFINITY;
-	WorkerStackType stackType = WorkerStackType::Auto;
+	std::optional<Strata::Placement> stackPlacement{};
 	const char *name = nullptr;
 };
 
 struct WorkerResult {
 	bool result = false;
 	WorkerStatus status = WorkerStatus::InternalError;
-	std::string message;
+	const char *message = "error";
 
 	explicit operator bool() const {
 		return result;
@@ -118,6 +118,10 @@ struct WorkerDiag {
 	bool cleanupTaskRunning = false;
 	uint32_t cleanupQueueDepth = 0;
 	uint32_t cleanupQueueHighWaterMark = 0;
+	Strata::Placement cleanupTaskStackPlacement = Strata::Placement::Default;
+	Strata::Region cleanupTaskStackRegion = Strata::Region::Unknown;
+	Strata::Placement cleanupQueueStoragePlacement = Strata::Placement::Default;
+	Strata::Region cleanupQueueStorageRegion = Strata::Region::Unknown;
 };
 
 struct WorkerJobDiag {
@@ -127,8 +131,8 @@ struct WorkerJobDiag {
 	uint32_t stackSize = 0;
 	UBaseType_t priority = 0;
 	BaseType_t coreId = tskNO_AFFINITY;
-	WorkerStackType requestedStackType = WorkerStackType::Auto;
-	WorkerStackType actualStackType = WorkerStackType::Internal;
+	Strata::Placement requestedStackPlacement = Strata::Placement::Default;
+	Strata::Region stackRegion = Strata::Region::Unknown;
 	uint32_t runCount = 0;
 	uint64_t startedAtMs = 0;
 	uint64_t lastRunAtMs = 0;
@@ -198,5 +202,5 @@ class Worker {
 	const char *jobStateToString(WorkerJobState state) const;
 
   private:
-	std::unique_ptr<WorkerImpl> _impl;
+	Strata::UniquePtr<WorkerImpl> _impl;
 };
