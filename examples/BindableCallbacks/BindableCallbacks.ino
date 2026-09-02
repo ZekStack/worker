@@ -33,7 +33,7 @@ void setup() {
 
 	WorkerResult initResult = worker.init();
 	if (!initResult) {
-		Serial.println(initResult.message.c_str());
+		Serial.println(initResult.message);
 		return;
 	}
 
