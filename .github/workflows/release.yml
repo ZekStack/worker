@@ -5,7 +5,7 @@ on:
 
 jobs:
   create-release:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, zekstack-ci]
     permissions:
       contents: write
     steps:
