@@ -2,10 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [ '**' ]
+    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: worker-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   ARDUINO_BOARD_MANAGER_ADDITIONAL_URLS: https://espressif.github.io/arduino-esp32/package_esp32_index.json
@@ -47,6 +51,7 @@ jobs:
     needs: source-audit
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         board: [esp32dev, esp32-s3-devkitc-1, esp32-c3-devkitm-1, esp32-p4-evboard]
     steps:
@@ -99,9 +104,10 @@ jobs:
 
   arduino-cli:
     runs-on: [self-hosted, zekstack-ci]
-    needs: source-audit
+    needs: [source-audit, build-examples]
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         board:
           - fqbn: esp32:esp32:esp32
