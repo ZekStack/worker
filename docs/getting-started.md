@@ -1,6 +1,6 @@
 # Getting started
 
-Worker `v0.2.0` requires Strata `v0.1.1` and C++20.
+Worker `v0.2.0` requires Strata `v0.1.4` and C++20.
 
 PlatformIO resolves the pinned Strata dependency from Worker's `library.json`. For Arduino IDE/manual installs, place both repositories in the Arduino libraries directory.
 
