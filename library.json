@@ -1,6 +1,6 @@
 {
   "name": "Worker",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "FreeRTOS task and cooperative job execution library for ESP32.",
   "keywords": [
     "esp32",
@@ -23,7 +23,7 @@
   "frameworks": "arduino",
   "platforms": "espressif32",
   "dependencies": {
-    "Strata": "https://github.com/ZekStack/strata.git#v0.1.1"
+    "Strata": "https://github.com/ZekStack/strata.git#v0.1.4"
   },
   "build": {
     "srcDir": "src",

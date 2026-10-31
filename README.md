@@ -1,5 +1,7 @@
 # Worker
 
+> Current version: **v0.3.0** with Strata **v0.1.4** pinned.
+
 Worker is a FreeRTOS task and cooperative job execution library for ESP32.
 
 Worker runs one-off and recurring background work with explicit task configuration, cooperative stop and sleep controls, event reporting, runtime diagnostics, and automatic task cleanup. Worker owns job orchestration and lifecycle policy while [Strata](https://github.com/ZekStack/strata) owns memory placement and low-level FreeRTOS storage.
@@ -21,7 +23,7 @@ Worker runs one-off and recurring background work with explicit task configurati
 
 ## Dependency
 
-Worker `v0.2.0` requires Strata `v0.1.1`.
+Worker `v0.3.0` requires Strata `v0.1.4`.
 
 ### PlatformIO
 
@@ -40,7 +42,7 @@ build_unflags =
     -std=gnu++11
 ```
 
-Worker's `library.json` pins Strata `v0.1.1`, so PlatformIO resolves it as a transitive dependency.
+Worker's `library.json` pins Strata `v0.1.4`, so PlatformIO resolves it as a transitive dependency.
 
 ### Arduino IDE
 
@@ -51,7 +53,7 @@ Arduino/libraries/Strata
 Arduino/libraries/Worker
 ```
 
-Use Strata `v0.1.1` or a compatible later release.
+Use Strata `v0.1.4` or a compatible later release.
 
 ## Quick start
 
@@ -241,9 +243,9 @@ worker.getJobDiagnostics(loop.jobId, jobDiag);
 | Framework | Arduino ESP32 |
 | Platform | `espressif32` / PIOArduino |
 | Language | C++20 |
-| Memory layer | Strata `v0.1.1` |
+| Memory layer | Strata `v0.1.4` |
 | External memory | Optional through Strata placement policies |
-| Dependencies | Strata `v0.1.1` |
+| Dependencies | Strata `v0.1.4` |
 | Exceptions | Not intentionally used by Worker APIs |
 | Status | `v0.2.0` API |
 
